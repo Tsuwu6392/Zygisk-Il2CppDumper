@@ -54,7 +54,7 @@ static void adddead_hook(void *self, void *src, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 3. MallData BuyItem Probe (Price Overwrite)
+// 3. Mall Hooks (Price = 0, Currency = True)
 // ---------------------------------------------------------
 typedef void (*BuyItem_t)(void *self, void *mallItem, void *onDone, void *mi);
 static BuyItem_t g_buyitem_orig;
@@ -62,14 +62,19 @@ static BuyItem_t g_buyitem_orig;
 static void buyitem_hook(void *self, void *mallItem, void *onDone, void *mi) {
     static int logged = 0;
     if (logged < 20) { logged++; LOGI("BuyItem hit! Forcing price to 0."); }
-    
     if (mallItem) {
-        // itemPrice is at 0x24, finalPrice is at 0x28 based on dump.cs
-        *(int *)((char *)mallItem + 0x24) = 0; 
-        *(int *)((char *)mallItem + 0x28) = 0; 
+        *(int *)((char *)mallItem + 0x24) = 0; // itemPrice
+        *(int *)((char *)mallItem + 0x28) = 0; // finalPrice
     }
-    
     g_buyitem_orig(self, mallItem, onDone, mi);
+}
+
+typedef bool (*HasEnough_t)(void *mallItem, void *mi);
+static HasEnough_t g_hasenough_orig;
+
+static bool hasenough_hook(void *mallItem, void *mi) {
+    LOGI("HasEnoughCurrency bypassed -> true");
+    return true;
 }
 
 // ---------------------------------------------------------
@@ -126,7 +131,7 @@ static void install(void *h) {
     }
 
 #if defined(__aarch64__)
-    {   // MallData
+    {   // MallData: BuyItem
         void *klass = class_from_name(image, "RGScript.Data.Mall", "MallData");
         if (!klass) {
             LOGE("hook: MallData not found");
@@ -139,10 +144,19 @@ static void install(void *h) {
             } else {
                 LOGE("hook: BuyItem not found");
             }
+
+            void *mi_he = method_by_name(klass, "HasEnoughCurrency", 1);
+            void *addr_he = mi_he ? *(void **) mi_he : nullptr;
+            if (addr_he) {
+                A64HookFunction(addr_he, (void *) hasenough_hook, (void **) &g_hasenough_orig);
+                LOGI("hook: HasEnoughCurrency @%p installed", addr_he);
+            } else {
+                LOGE("hook: HasEnoughCurrency not found");
+            }
         }
     }
 
-    {   // TalentImpl
+    {   // TalentImpl: VoidShield
         void *klass = class_from_name(image, "TalentImpl", "BuffImplVoidShield");
         if (!klass) {
             LOGE("hook: TalentImpl.BuffImplVoidShield not found");
