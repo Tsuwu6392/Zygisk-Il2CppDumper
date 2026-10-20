@@ -95,15 +95,6 @@ static void consumegem_hook(void *self, int amount, bool unk1, bool unk2, void *
 //    Fields:
 //      max_energy : Int32 @ +0x178
 //      _energy    : Int32 @ +0x17c
-//
-//    SetUpChar hook:
-//      Runs once on character spawn. Add +1000 to max_energy
-//      here so the field and UI are correct from the start.
-//
-//    set_energy hook:
-//      Belt-and-suspenders: re-applies the bonus if max was
-//      reset (e.g. room transition), then refills to max when
-//      current drops to <= 100.
 // ---------------------------------------------------------
 static const int ENERGY_BONUS  = 1000;
 static const int ENERGY_REFILL = 100;
@@ -114,10 +105,6 @@ static SetUpChar_t g_setupchar_orig;
 static void setupchar_hook(void *self, void *mi) {
     g_setupchar_orig(self, mi);
     if (!self) return;
-
-    // After the game has initialised max_energy from config,
-    // add our flat bonus. Natural base is < 1000, so the
-    // < 10000 guard reliably catches post-reset values.
     int *p_max = (int *)((char *)self + 0x178);
     int cur_max = *p_max;
     if (cur_max > 0 && cur_max < 10000) {
@@ -136,7 +123,6 @@ static void setenergy_hook(void *self, int value, void *mi) {
     int *p_max = (int *)((char *)self + 0x178);
     int *p_cur = (int *)((char *)self + 0x17c);
 
-    // Re-apply bonus if a reset slipped past SetUpChar
     int cur_max = *p_max;
     if (cur_max > 0 && cur_max < 10000) {
         *p_max = cur_max + ENERGY_BONUS;
@@ -145,7 +131,6 @@ static void setenergy_hook(void *self, int value, void *mi) {
 
     g_setenergy_orig(self, value, mi);
 
-    // Refill when at or below threshold
     int after = *p_cur;
     int new_max = *p_max;
     if (after <= ENERGY_REFILL && new_max > 0) {
@@ -156,11 +141,8 @@ static void setenergy_hook(void *self, int value, void *mi) {
 
 // ---------------------------------------------------------
 // 6. Skill Cooldown Hook (RoleAttributePlayer)
-//
-//    SkillReload(Single deltaTime) — argc 1 — advances the
-//    internal cooldown accumulator each fixed update tick.
-//    Multiplying deltaTime by 10 makes it fill 10x faster
-//    regardless of what the UI getter returns.
+//    SkillReload(Single deltaTime) — argc 1
+//    Multiply deltaTime by 10 = 10x faster cooldown.
 // ---------------------------------------------------------
 typedef void (*SkillReload_t)(void *self, float deltaTime, void *mi);
 static SkillReload_t g_skillreload_orig;
@@ -175,7 +157,91 @@ static void skillreload_hook(void *self, float deltaTime, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 7. Installer
+// 7. Currency Flip Hooks (ItemData)
+//
+//    ConsumeMaterial is the unified spend path for all
+//    in-battle currencies (GoldCoin, StarCoin, VoidCoin,
+//    VoidEye, ElementCoin, FireCoin, SeasonCoin, etc.)
+//
+//    Instead of consuming, we call AddMaterial with the
+//    same itemName and count — turning every spend into
+//    a gain. Original is skipped entirely.
+//
+//    AddMaterial signature (argc 9):
+//      String itemName, Int32 count, String source,
+//      Boolean save, SeasonCoinChangeReason changeCoinReason,
+//      Boolean fromActivity, Boolean showMergeUI,
+//      emObtainGemType obtainType, String trackReason
+//
+//    ConsumeMaterial overload A (argc 3):
+//      String itemName, Int32 count, Boolean needRecord
+//
+//    ConsumeMaterial overload B (argc 6):
+//      String itemName, Int32 count, Boolean save,
+//      Boolean needRecord, Boolean fromActivity, String trackReason
+// ---------------------------------------------------------
+
+// AddMaterial function pointer — resolved at install time
+typedef bool (*AddMaterial_t)(void *self,
+                              void *itemName,   // String (IL2CPP object*)
+                              int   count,
+                              void *source,     // String
+                              bool  save,
+                              int   changeCoinReason,  // SeasonCoinChangeReason enum
+                              bool  fromActivity,
+                              bool  showMergeUI,
+                              int   obtainType,        // emObtainGemType enum
+                              void *trackReason,       // String
+                              void *mi);
+static AddMaterial_t g_addmaterial = nullptr;
+
+// ConsumeMaterial overload A: argc 3
+typedef void (*ConsumeMat3_t)(void *self, void *itemName, int count, bool needRecord, void *mi);
+static ConsumeMat3_t g_consumemat3_orig;
+
+static void consumemat3_hook(void *self, void *itemName, int count, bool needRecord, void *mi) {
+    static int logged = 0;
+    if (logged < 20) { logged++; LOGI("ConsumeMaterial(3) flipped: count=%d", count); }
+    // Skip consume, add instead
+    if (g_addmaterial && self && itemName) {
+        g_addmaterial(self, itemName, count,
+                      nullptr,  // source = null
+                      false,    // save
+                      0,        // SeasonCoinChangeReason.Debug
+                      false,    // fromActivity
+                      false,    // showMergeUI
+                      0,        // emObtainGemType default
+                      nullptr,  // trackReason = null
+                      mi);
+    }
+}
+
+// ConsumeMaterial overload B: argc 6
+typedef void (*ConsumeMat6_t)(void *self, void *itemName, int count,
+                               bool save, bool needRecord, bool fromActivity,
+                               void *trackReason, void *mi);
+static ConsumeMat6_t g_consumemat6_orig;
+
+static void consumemat6_hook(void *self, void *itemName, int count,
+                              bool save, bool needRecord, bool fromActivity,
+                              void *trackReason, void *mi) {
+    static int logged = 0;
+    if (logged < 20) { logged++; LOGI("ConsumeMaterial(6) flipped: count=%d", count); }
+    if (g_addmaterial && self && itemName) {
+        g_addmaterial(self, itemName, count,
+                      nullptr,       // source = null
+                      save,          // honour original save flag
+                      0,             // SeasonCoinChangeReason.Debug
+                      fromActivity,  // honour original flag
+                      false,         // showMergeUI
+                      0,             // emObtainGemType default
+                      trackReason,   // pass through
+                      mi);
+    }
+}
+
+// ---------------------------------------------------------
+// 8. Installer
 // ---------------------------------------------------------
 static void install(void *h) {
 #define S(n) xdl_sym(h, n, nullptr)
@@ -293,7 +359,6 @@ static void install(void *h) {
         if (!klass) {
             LOGE("hook: RoleAttributePlayer not found");
         } else {
-            // SetUpChar — argc 0
             void *mi0 = method_by_name(klass, "SetUpChar", 0);
             void *addr0 = mi0 ? *(void **) mi0 : nullptr;
             if (addr0) {
@@ -301,7 +366,6 @@ static void install(void *h) {
                 LOGI("hook: RoleAttributePlayer.SetUpChar @%p installed", addr0);
             } else { LOGE("hook: SetUpChar not found in RoleAttributePlayer"); }
 
-            // set_energy — argc 1
             void *mi1 = method_by_name(klass, "set_energy", 1);
             void *addr1 = mi1 ? *(void **) mi1 : nullptr;
             if (addr1) {
@@ -309,17 +373,43 @@ static void install(void *h) {
                 LOGI("hook: RoleAttributePlayer.set_energy @%p installed", addr1);
             } else { LOGE("hook: set_energy not found in RoleAttributePlayer"); }
 
-            // SkillReload(Single deltaTime) — argc 1
-            // method_by_name returns the first match by argc.
-            // Both overloads take 1 arg internally (self + mi implicit):
-            //   SkillReload()           -> argc 0
-            //   SkillReload(Single dt)  -> argc 1
             void *mi2 = method_by_name(klass, "SkillReload", 1);
             void *addr2 = mi2 ? *(void **) mi2 : nullptr;
             if (addr2) {
                 A64HookFunction(addr2, (void *) skillreload_hook, (void **) &g_skillreload_orig);
                 LOGI("hook: RoleAttributePlayer.SkillReload(dt) @%p installed", addr2);
             } else { LOGE("hook: SkillReload(dt) not found in RoleAttributePlayer"); }
+        }
+    }
+
+    // --- ItemData: ConsumeMaterial flip ---
+    {
+        void *klass = class_from_name(image, "", "ItemData");
+        if (!klass) {
+            LOGE("hook: ItemData not found");
+        } else {
+            // Resolve AddMaterial (argc 9) first — needed by both consume hooks
+            void *mi_add = method_by_name(klass, "AddMaterial", 9);
+            if (mi_add) {
+                g_addmaterial = (AddMaterial_t) *(void **) mi_add;
+                LOGI("hook: ItemData.AddMaterial @%p resolved", (void*)g_addmaterial);
+            } else { LOGE("hook: AddMaterial not found in ItemData"); }
+
+            // ConsumeMaterial argc 3
+            void *mi3 = method_by_name(klass, "ConsumeMaterial", 3);
+            void *addr3 = mi3 ? *(void **) mi3 : nullptr;
+            if (addr3) {
+                A64HookFunction(addr3, (void *) consumemat3_hook, (void **) &g_consumemat3_orig);
+                LOGI("hook: ItemData.ConsumeMaterial(3) @%p installed", addr3);
+            } else { LOGE("hook: ConsumeMaterial(3) not found in ItemData"); }
+
+            // ConsumeMaterial argc 6
+            void *mi6 = method_by_name(klass, "ConsumeMaterial", 6);
+            void *addr6 = mi6 ? *(void **) mi6 : nullptr;
+            if (addr6) {
+                A64HookFunction(addr6, (void *) consumemat6_hook, (void **) &g_consumemat6_orig);
+                LOGI("hook: ItemData.ConsumeMaterial(6) @%p installed", addr6);
+            } else { LOGE("hook: ConsumeMaterial(6) not found in ItemData"); }
         }
     }
 #endif
