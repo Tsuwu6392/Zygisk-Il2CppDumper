@@ -53,8 +53,13 @@ typedef void (*BuyItem_t)(void *self, void *mallItem, void *onDone, void *mi);
 static BuyItem_t g_buyitem_orig;
 
 static void buyitem_hook(void *self, void *mallItem, void *onDone, void *mi) {
-    static int logged = 0;
-    if (logged < 20) { logged++; LOGI("BuyItem hit self=%p item=%p cb=%p", self, mallItem, onDone); }
+    LOGI("BuyItem hit! Forcing price to 0");
+    
+    // MallItem has an Int32 price at offset 0x24 (we saw this in ChooseHeroData)
+    if (mallItem) {
+        *(int *)((char *)mallItem + 0x24) = 0; 
+    }
+    
     g_buyitem_orig(self, mallItem, onDone, mi);
 }
 
