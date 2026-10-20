@@ -478,33 +478,37 @@ static void __fix_instructions(uint32_t *__restrict inp, int32_t count, uint32_t
 //-------------------------------------------------------------------------
 
 extern "C" {
-    static __attribute__((__aligned__(__page_size))) uint32_t __insns_pool[A64_MAX_BACKUPS][A64_MAX_INSTRUCTIONS * 10];
-
-    //-------------------------------------------------------------------------
+    static uint32_t (*__insns_pool)[A64_MAX_INSTRUCTIONS * 10] = NULL;
 
     class A64HookInit
     {
     public:
         A64HookInit()
         {
-            __make_rwx(__insns_pool, sizeof(__insns_pool));
+            void *p = ::mmap(NULL, sizeof(uint32_t) * A64_MAX_BACKUPS * A64_MAX_INSTRUCTIONS * 10,
+                             PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED) {
+                A64_LOGE("rwx mmap failed, errno = %d", errno);
+                return;
+            }
+            __insns_pool = reinterpret_cast<uint32_t (*)[A64_MAX_INSTRUCTIONS * 10]>(p);
             A64_LOGI("insns pool initialized.");
         }
     };
     static A64HookInit __init;
 
-    //-------------------------------------------------------------------------
-
     static uint32_t *FastAllocateTrampoline()
     {
-        static_assert((A64_MAX_INSTRUCTIONS * 10 * sizeof(uint32_t)) % 8 == 0, "8-byte align");
         static volatile int32_t __index = -1;
-
+        if (__insns_pool == NULL) {
+            A64_LOGE("trampoline pool missing!");
+            return NULL;
+        }
         int32_t i = __atomic_increase(&__index);
-        if (__predict_true(i >= 0 && i < __countof(__insns_pool))) {
+        if (__predict_true(i >= 0 && i < A64_MAX_BACKUPS)) {
             return __insns_pool[i];
-        } //if
-
+        }
         A64_LOGE("failed to allocate trampoline!");
         return NULL;
     }
