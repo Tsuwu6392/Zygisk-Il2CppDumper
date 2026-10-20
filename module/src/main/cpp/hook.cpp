@@ -49,6 +49,15 @@ static void adddead_hook(void *self, void *src, void *mi) {
     if (logged < 20) { logged++; LOGI("AddDelayDeadBuff blocked"); }
 }
 
+typedef void (*BuyItem_t)(void *self, void *mallItem, void *onDone, void *mi);
+static BuyItem_t g_buyitem_orig;
+
+static void buyitem_hook(void *self, void *mallItem, void *onDone, void *mi) {
+    static int logged = 0;
+    if (logged < 20) { logged++; LOGI("BuyItem hit self=%p item=%p cb=%p", self, mallItem, onDone); }
+    g_buyitem_orig(self, mallItem, onDone, mi);
+}
+
 static void install(void *h) {
 #define S(n) xdl_sym(h, n, nullptr)
     auto is_vm = (bool (*)(void *)) S("il2cpp_is_vm_thread");
@@ -100,7 +109,23 @@ static void install(void *h) {
     }
 
 #if defined(__aarch64__)
-    {
+    {   // ← MallData gets its own braces
+        void *klass = class_from_name(image, "RGScript.Data.Mall", "MallData");
+        if (!klass) {
+            LOGE("hook: MallData not found");
+        } else {
+            void *mi = method_by_name(klass, "BuyItem", 2);
+            void *addr = mi ? *(void **) mi : nullptr;
+            if (addr) {
+                A64HookFunction(addr, (void *) buyitem_hook, (void **) &g_buyitem_orig);
+                LOGI("hook: MallData.BuyItem @%p installed", addr);
+            } else {
+                LOGE("hook: BuyItem not found");
+            }
+        }
+    }   // ← close MallData block
+
+    {   // ← TalentImpl block, separate scope
         void *klass = class_from_name(image, "TalentImpl", "BuffImplVoidShield");
         if (!klass) {
             LOGE("hook: TalentImpl.BuffImplVoidShield not found");
@@ -123,7 +148,7 @@ static void install(void *h) {
                 LOGE("hook: AddDelayDeadBuff not found");
             }
         }
-    }
+    }   // ← close TalentImpl block
 #endif
 }
 
