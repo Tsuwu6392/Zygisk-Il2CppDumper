@@ -24,6 +24,21 @@ static void hurt_hook(void *self, int damage, void *src, void *mi) {
 }
 static void *const g_repl[3] = {(void *) hurt_hook<0>, (void *) hurt_hook<1>, (void *) hurt_hook<2>};
 
+typedef bool (*Consume_t)(void *self, void *ev, void *mi);
+static Consume_t g_consume_orig;
+
+static bool consume_hook(void *self, void *ev, void *mi) {
+    static int logged = 0;
+    int before = self ? *(int *)((char *)self + 0x18) : 0;
+    bool r = g_consume_orig(self, ev, mi);
+    if (self && before > 0) {
+        int after = *(int *)((char *)self + 0x18);
+        if (logged < 20) { logged++; LOGI("VoidShield consume: count %d -> %d", before, after); }
+        *(int *)((char *)self + 0x18) = before;
+    }
+    return r;
+}
+
 static void install(void *h) {
 #define S(n) xdl_sym(h, n, nullptr)
     auto is_vm = (bool (*)(void *)) S("il2cpp_is_vm_thread");
@@ -73,6 +88,19 @@ static void install(void *h) {
         LOGE("hook: arm64 only, skipped %s", nm);
 #endif
     }
+    #if defined(__aarch64__)
+    {
+        void *klass = class_from_name(image, "", "BuffImplVoidShield");
+        void *mi = klass ? method_by_name(klass, "OnBeforePlayerConsumeVoidShield", 1) : nullptr;
+        void *addr = mi ? *(void **) mi : nullptr;
+        if (addr) {
+            A64HookFunction(addr, (void *) consume_hook, (void **) &g_consume_orig);
+            LOGI("hook: VoidShield consume @%p installed", addr);
+        } else {
+            LOGE("hook: OnBeforePlayerConsumeVoidShield not found");
+        }
+    }
+#endif
 }
 
 void hook_start(void *handle) { std::thread(install, handle).detach(); }
