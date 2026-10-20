@@ -24,6 +24,7 @@ static void hurt_hook(void *self, int damage, void *src, void *mi) {
 }
 static void *const g_repl[3] = {(void *) hurt_hook<0>, (void *) hurt_hook<1>, (void *) hurt_hook<2>};
 
+// TalentImpl.BuffImplVoidShield: _shieldCount at this+0x18
 typedef bool (*Consume_t)(void *self, void *ev, void *mi);
 static Consume_t g_consume_orig;
 
@@ -37,6 +38,15 @@ static bool consume_hook(void *self, void *ev, void *mi) {
         *(int *)((char *)self + 0x18) = before;
     }
     return r;
+}
+
+// Blocks the death countdown started when the void shield is empty
+typedef void (*AddDead_t)(void *self, void *src, void *mi);
+static AddDead_t g_adddead_orig;
+
+static void adddead_hook(void *self, void *src, void *mi) {
+    static int logged = 0;
+    if (logged < 20) { logged++; LOGI("AddDelayDeadBuff blocked"); }
 }
 
 static void install(void *h) {
@@ -88,16 +98,30 @@ static void install(void *h) {
         LOGE("hook: arm64 only, skipped %s", nm);
 #endif
     }
-    #if defined(__aarch64__)
+
+#if defined(__aarch64__)
     {
-        void *klass = class_from_name(image, "", "BuffImplVoidShield");
-        void *mi = klass ? method_by_name(klass, "OnBeforePlayerConsumeVoidShield", 1) : nullptr;
-        void *addr = mi ? *(void **) mi : nullptr;
-        if (addr) {
-            A64HookFunction(addr, (void *) consume_hook, (void **) &g_consume_orig);
-            LOGI("hook: VoidShield consume @%p installed", addr);
+        void *klass = class_from_name(image, "TalentImpl", "BuffImplVoidShield");
+        if (!klass) {
+            LOGE("hook: TalentImpl.BuffImplVoidShield not found");
         } else {
-            LOGE("hook: OnBeforePlayerConsumeVoidShield not found");
+            void *mi = method_by_name(klass, "OnBeforePlayerConsumeVoidShield", 1);
+            void *addr = mi ? *(void **) mi : nullptr;
+            if (addr) {
+                A64HookFunction(addr, (void *) consume_hook, (void **) &g_consume_orig);
+                LOGI("hook: VoidShield consume @%p installed", addr);
+            } else {
+                LOGE("hook: OnBeforePlayerConsumeVoidShield not found");
+            }
+
+            void *mi2 = method_by_name(klass, "AddDelayDeadBuff", 1);
+            void *addr2 = mi2 ? *(void **) mi2 : nullptr;
+            if (addr2) {
+                A64HookFunction(addr2, (void *) adddead_hook, (void **) &g_adddead_orig);
+                LOGI("hook: AddDelayDeadBuff @%p installed", addr2);
+            } else {
+                LOGE("hook: AddDelayDeadBuff not found");
+            }
         }
     }
 #endif
