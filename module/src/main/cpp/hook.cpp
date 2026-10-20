@@ -9,6 +9,9 @@
 extern "C" void A64HookFunction(void *symbol, void *replace, void **result);
 #endif
 
+// ---------------------------------------------------------
+// 1. HurtHp Hooks
+// ---------------------------------------------------------
 typedef void (*HurtHp_t)(void *self, int damage, void *src, void *mi);
 static HurtHp_t g_orig[3];
 static thread_local int g_depth = 0;
@@ -24,7 +27,9 @@ static void hurt_hook(void *self, int damage, void *src, void *mi) {
 }
 static void *const g_repl[3] = {(void *) hurt_hook<0>, (void *) hurt_hook<1>, (void *) hurt_hook<2>};
 
-// TalentImpl.BuffImplVoidShield: _shieldCount at this+0x18
+// ---------------------------------------------------------
+// 2. VoidShield Hooks
+// ---------------------------------------------------------
 typedef bool (*Consume_t)(void *self, void *ev, void *mi);
 static Consume_t g_consume_orig;
 
@@ -40,7 +45,6 @@ static bool consume_hook(void *self, void *ev, void *mi) {
     return r;
 }
 
-// Blocks the death countdown started when the void shield is empty
 typedef void (*AddDead_t)(void *self, void *src, void *mi);
 static AddDead_t g_adddead_orig;
 
@@ -49,20 +53,28 @@ static void adddead_hook(void *self, void *src, void *mi) {
     if (logged < 20) { logged++; LOGI("AddDelayDeadBuff blocked"); }
 }
 
+// ---------------------------------------------------------
+// 3. MallData BuyItem Probe (Price Overwrite)
+// ---------------------------------------------------------
 typedef void (*BuyItem_t)(void *self, void *mallItem, void *onDone, void *mi);
 static BuyItem_t g_buyitem_orig;
 
 static void buyitem_hook(void *self, void *mallItem, void *onDone, void *mi) {
-    LOGI("BuyItem hit! Forcing price to 0");
+    static int logged = 0;
+    if (logged < 20) { logged++; LOGI("BuyItem hit! Forcing price to 0."); }
     
-    // MallItem has an Int32 price at offset 0x24 (we saw this in ChooseHeroData)
     if (mallItem) {
+        // itemPrice is at 0x24, finalPrice is at 0x28 based on dump.cs
         *(int *)((char *)mallItem + 0x24) = 0; 
+        *(int *)((char *)mallItem + 0x28) = 0; 
     }
     
     g_buyitem_orig(self, mallItem, onDone, mi);
 }
 
+// ---------------------------------------------------------
+// 4. Installer
+// ---------------------------------------------------------
 static void install(void *h) {
 #define S(n) xdl_sym(h, n, nullptr)
     auto is_vm = (bool (*)(void *)) S("il2cpp_is_vm_thread");
@@ -114,7 +126,7 @@ static void install(void *h) {
     }
 
 #if defined(__aarch64__)
-    {   // ← MallData gets its own braces
+    {   // MallData
         void *klass = class_from_name(image, "RGScript.Data.Mall", "MallData");
         if (!klass) {
             LOGE("hook: MallData not found");
@@ -128,9 +140,9 @@ static void install(void *h) {
                 LOGE("hook: BuyItem not found");
             }
         }
-    }   // ← close MallData block
+    }
 
-    {   // ← TalentImpl block, separate scope
+    {   // TalentImpl
         void *klass = class_from_name(image, "TalentImpl", "BuffImplVoidShield");
         if (!klass) {
             LOGE("hook: TalentImpl.BuffImplVoidShield not found");
@@ -153,7 +165,7 @@ static void install(void *h) {
                 LOGE("hook: AddDelayDeadBuff not found");
             }
         }
-    }   // ← close TalentImpl block
+    }
 #endif
 }
 
