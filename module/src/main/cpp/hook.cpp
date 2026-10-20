@@ -96,13 +96,35 @@ static void consumegem_hook(void *self, int amount, bool unk1, bool unk2, void *
 //      max_energy : Int32 @ +0x178
 //      _energy    : Int32 @ +0x17c
 //
+//    SetUpChar hook:
+//      Runs once on character spawn. Add +1000 to max_energy
+//      here so the field and UI are correct from the start.
+//
 //    set_energy hook:
-//      a) bump max_energy by +1000 once (idempotent, natural base < 10000)
-//      b) call original
-//      c) if _energy <= 100, refill to max_energy
+//      Belt-and-suspenders: re-applies the bonus if max was
+//      reset (e.g. room transition), then refills to max when
+//      current drops to <= 100.
 // ---------------------------------------------------------
 static const int ENERGY_BONUS  = 1000;
 static const int ENERGY_REFILL = 100;
+
+typedef void (*SetUpChar_t)(void *self, void *mi);
+static SetUpChar_t g_setupchar_orig;
+
+static void setupchar_hook(void *self, void *mi) {
+    g_setupchar_orig(self, mi);
+    if (!self) return;
+
+    // After the game has initialised max_energy from config,
+    // add our flat bonus. Natural base is < 1000, so the
+    // < 10000 guard reliably catches post-reset values.
+    int *p_max = (int *)((char *)self + 0x178);
+    int cur_max = *p_max;
+    if (cur_max > 0 && cur_max < 10000) {
+        *p_max = cur_max + ENERGY_BONUS;
+        LOGI("energy: SetUpChar max %d -> %d", cur_max, *p_max);
+    }
+}
 
 typedef void (*SetEnergy_t)(void *self, int value, void *mi);
 static SetEnergy_t g_setenergy_orig;
@@ -114,17 +136,16 @@ static void setenergy_hook(void *self, int value, void *mi) {
     int *p_max = (int *)((char *)self + 0x178);
     int *p_cur = (int *)((char *)self + 0x17c);
 
-    // a) Apply +1000 max bonus idempotently
+    // Re-apply bonus if a reset slipped past SetUpChar
     int cur_max = *p_max;
     if (cur_max > 0 && cur_max < 10000) {
         *p_max = cur_max + ENERGY_BONUS;
-        if (logged < 20) { logged++; LOGI("energy: max bumped %d -> %d", cur_max, *p_max); }
+        if (logged < 20) { logged++; LOGI("energy: set_energy re-bumped max %d -> %d", cur_max, *p_max); }
     }
 
-    // b) Call original setter
     g_setenergy_orig(self, value, mi);
 
-    // c) Refill if at or below threshold
+    // Refill when at or below threshold
     int after = *p_cur;
     int new_max = *p_max;
     if (after <= ENERGY_REFILL && new_max > 0) {
@@ -136,24 +157,21 @@ static void setenergy_hook(void *self, int value, void *mi) {
 // ---------------------------------------------------------
 // 6. Skill Cooldown Hook (RoleAttributePlayer)
 //
-//    get_skillCd() returns Single — the remaining cooldown time
-//    the game reads to decide when the skill is ready.
-//    Return 10% of the original value = 10x faster cooldown.
-//
-//    argc = 0 (no explicit parameters; self + MethodInfo* are implicit)
+//    SkillReload(Single deltaTime) — argc 1 — advances the
+//    internal cooldown accumulator each fixed update tick.
+//    Multiplying deltaTime by 10 makes it fill 10x faster
+//    regardless of what the UI getter returns.
 // ---------------------------------------------------------
-typedef float (*GetSkillCd_t)(void *self, void *mi);
-static GetSkillCd_t g_getskillcd_orig;
+typedef void (*SkillReload_t)(void *self, float deltaTime, void *mi);
+static SkillReload_t g_skillreload_orig;
 
-static float getskillcd_hook(void *self, void *mi) {
+static void skillreload_hook(void *self, float deltaTime, void *mi) {
     static int logged = 0;
-    float orig = g_getskillcd_orig(self, mi);
-    float reduced = orig * 0.1f;
-    if (logged < 20 && orig > 0.0f) {
+    if (logged < 20 && deltaTime > 0.0f) {
         logged++;
-        LOGI("skillCd: %.3f -> %.3f", orig, reduced);
+        LOGI("SkillReload: dt=%.4f -> %.4f", deltaTime, deltaTime * 10.0f);
     }
-    return reduced;
+    g_skillreload_orig(self, deltaTime * 10.0f, mi);
 }
 
 // ---------------------------------------------------------
@@ -192,10 +210,10 @@ static void install(void *h) {
     if (!image) { LOGE("hook: Assembly-CSharp not found"); return; }
 
     // --- HurtHp ---
-    const char *names[3] = {"RGController", "C12Controller", "C13Controller"};
+    const char *hurtnames[3] = {"RGController", "C12Controller", "C13Controller"};
     std::set<void *> done;
     int slot = 0;
-    for (auto nm : names) {
+    for (auto nm : hurtnames) {
         void *klass = class_from_name(image, "", nm);
         if (!klass) { LOGE("hook: class %s not found", nm); continue; }
         void *mi = method_by_name(klass, "HurtHp", 2);
@@ -269,27 +287,39 @@ static void install(void *h) {
         }
     }
 
-    // --- RoleAttributePlayer: set_energy + get_skillCd ---
+    // --- RoleAttributePlayer: SetUpChar + set_energy + SkillReload ---
     {
         void *klass = class_from_name(image, "", "RoleAttributePlayer");
         if (!klass) {
             LOGE("hook: RoleAttributePlayer not found");
         } else {
-            // set_energy — argc 1 (the Int32 value parameter)
-            void *mi = method_by_name(klass, "set_energy", 1);
-            void *addr = mi ? *(void **) mi : nullptr;
-            if (addr) {
-                A64HookFunction(addr, (void *) setenergy_hook, (void **) &g_setenergy_orig);
-                LOGI("hook: RoleAttributePlayer.set_energy @%p installed", addr);
+            // SetUpChar — argc 0
+            void *mi0 = method_by_name(klass, "SetUpChar", 0);
+            void *addr0 = mi0 ? *(void **) mi0 : nullptr;
+            if (addr0) {
+                A64HookFunction(addr0, (void *) setupchar_hook, (void **) &g_setupchar_orig);
+                LOGI("hook: RoleAttributePlayer.SetUpChar @%p installed", addr0);
+            } else { LOGE("hook: SetUpChar not found in RoleAttributePlayer"); }
+
+            // set_energy — argc 1
+            void *mi1 = method_by_name(klass, "set_energy", 1);
+            void *addr1 = mi1 ? *(void **) mi1 : nullptr;
+            if (addr1) {
+                A64HookFunction(addr1, (void *) setenergy_hook, (void **) &g_setenergy_orig);
+                LOGI("hook: RoleAttributePlayer.set_energy @%p installed", addr1);
             } else { LOGE("hook: set_energy not found in RoleAttributePlayer"); }
 
-            // get_skillCd — argc 0 (no explicit parameters)
-            void *mi2 = method_by_name(klass, "get_skillCd", 0);
+            // SkillReload(Single deltaTime) — argc 1
+            // method_by_name returns the first match by argc.
+            // Both overloads take 1 arg internally (self + mi implicit):
+            //   SkillReload()           -> argc 0
+            //   SkillReload(Single dt)  -> argc 1
+            void *mi2 = method_by_name(klass, "SkillReload", 1);
             void *addr2 = mi2 ? *(void **) mi2 : nullptr;
             if (addr2) {
-                A64HookFunction(addr2, (void *) getskillcd_hook, (void **) &g_getskillcd_orig);
-                LOGI("hook: RoleAttributePlayer.get_skillCd @%p installed", addr2);
-            } else { LOGE("hook: get_skillCd not found in RoleAttributePlayer"); }
+                A64HookFunction(addr2, (void *) skillreload_hook, (void **) &g_skillreload_orig);
+                LOGI("hook: RoleAttributePlayer.SkillReload(dt) @%p installed", addr2);
+            } else { LOGE("hook: SkillReload(dt) not found in RoleAttributePlayer"); }
         }
     }
 #endif
