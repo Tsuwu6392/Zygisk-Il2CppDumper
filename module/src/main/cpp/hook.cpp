@@ -5,7 +5,9 @@
 #include "log.h"
 #include "xdl.h"
 
-extern "C" int DobbyHook(void *address, void *replace_func, void **origin_func);
+#if defined(__aarch64__)
+extern "C" void A64HookFunction(void *symbol, void *replace, void **result);
+#endif
 
 typedef void (*HurtHp_t)(void *self, int damage, void *src, void *mi);
 static HurtHp_t g_orig[3];
@@ -63,9 +65,13 @@ static void install(void *h) {
         if (!mi) { LOGE("hook: HurtHp not found in %s", nm); continue; }
         void *addr = *(void **) mi;
         if (!addr || !done.insert(addr).second) continue;
-        int rc = DobbyHook(addr, g_repl[slot], (void **) &g_orig[slot]);
-        LOGI("hook: %s HurtHp @%p rc=%d", nm, addr, rc);
+#if defined(__aarch64__)
+        A64HookFunction(addr, g_repl[slot], (void **) &g_orig[slot]);
+        LOGI("hook: %s HurtHp @%p installed", nm, addr);
         slot++;
+#else
+        LOGE("hook: arm64 only, skipped %s", nm);
+#endif
     }
 }
 

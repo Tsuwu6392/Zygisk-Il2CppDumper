@@ -29,29 +29,24 @@ set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 include_directories(
         xdl/include
-        Dobby/include
 )
 
 aux_source_directory(xdl xdl-src)
 
-# Dobby inline hook, built as a static library
-set(DOBBY_GENERATE_SHARED OFF CACHE BOOL "" FORCE)
-set(DOBBY_DEBUG OFF CACHE BOOL "" FORCE)
-set(Plugin.SymbolResolver OFF CACHE BOOL "" FORCE)
-add_subdirectory(Dobby)
+# And64InlineHook is arm64 only
+set(HOOK_LIB_SRC "")
+if (ANDROID_ABI STREQUAL "arm64-v8a")
+    set(HOOK_LIB_SRC And64InlineHook.cpp)
+endif ()
 
 add_library(${MODULE_NAME} SHARED
         main.cpp
         hack.cpp
         hook.cpp
         il2cpp_dump.cpp
+        ${HOOK_LIB_SRC}
         ${xdl-src})
 target_link_libraries(${MODULE_NAME} log)
-if (TARGET dobby_static)
-    target_link_libraries(${MODULE_NAME} dobby_static)
-else ()
-    target_link_libraries(${MODULE_NAME} dobby)
-endif ()
 
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_custom_command(TARGET ${MODULE_NAME} POST_BUILD
