@@ -141,58 +141,47 @@ static void setenergy_hook(void *self, int value, void *mi) {
 
 // ---------------------------------------------------------
 // 6. Skill Cooldown Hook (RoleAttributePlayer)
-//    SkillReload(Single deltaTime) — argc 1
-//    Multiply deltaTime by 10 = 10x faster cooldown.
+//
+//    SkillReload(Single deltaTime) — argc 1.
+//    Multiplies deltaTime by 10 for faster cooldown.
+//
+//    this_skill_time @ +0x1a0 is the active buff/skill
+//    duration timer — saved before and restored after the
+//    boosted call so buff durations are unaffected.
 // ---------------------------------------------------------
 typedef void (*SkillReload_t)(void *self, float deltaTime, void *mi);
 static SkillReload_t g_skillreload_orig;
 
 static void skillreload_hook(void *self, float deltaTime, void *mi) {
     static int logged = 0;
+    if (!self) { g_skillreload_orig(self, deltaTime, mi); return; }
+
+    // Save active skill duration timer before boosted tick
+    float *p_skill_time = (float *)((char *)self + 0x1a0);
+    float saved_skill_time = *p_skill_time;
+
     if (logged < 20 && deltaTime > 0.0f) {
         logged++;
-        LOGI("SkillReload: dt=%.4f -> %.4f", deltaTime, deltaTime * 10.0f);
+        LOGI("SkillReload: dt=%.4f -> %.4f skill_time=%.4f", deltaTime, deltaTime * 10.0f, saved_skill_time);
     }
+
     g_skillreload_orig(self, deltaTime * 10.0f, mi);
+
+    // Restore so active buff/skill duration is unaffected
+    *p_skill_time = saved_skill_time;
 }
 
 // ---------------------------------------------------------
-// 7. Currency Flip Hooks (ItemData)
+// 7. Out-of-dungeon Currency Flip (ItemData)
 //
-//    ConsumeMaterial is the unified spend path for all
-//    in-battle currencies (GoldCoin, StarCoin, VoidCoin,
-//    VoidEye, ElementCoin, FireCoin, SeasonCoin, etc.)
-//
-//    Instead of consuming, we call AddMaterial with the
-//    same itemName and count — turning every spend into
-//    a gain. Original is skipped entirely.
-//
-//    AddMaterial signature (argc 9):
-//      String itemName, Int32 count, String source,
-//      Boolean save, SeasonCoinChangeReason changeCoinReason,
-//      Boolean fromActivity, Boolean showMergeUI,
-//      emObtainGemType obtainType, String trackReason
-//
-//    ConsumeMaterial overload A (argc 3):
-//      String itemName, Int32 count, Boolean needRecord
-//
-//    ConsumeMaterial overload B (argc 6):
-//      String itemName, Int32 count, Boolean save,
-//      Boolean needRecord, Boolean fromActivity, String trackReason
+//    ConsumeMaterial is the unified spend path for
+//    persistent currencies (SeasonCoin etc.)
+//    Flipped to call AddMaterial instead.
 // ---------------------------------------------------------
-
-// AddMaterial function pointer — resolved at install time
-typedef bool (*AddMaterial_t)(void *self,
-                              void *itemName,   // String (IL2CPP object*)
-                              int   count,
-                              void *source,     // String
-                              bool  save,
-                              int   changeCoinReason,  // SeasonCoinChangeReason enum
-                              bool  fromActivity,
-                              bool  showMergeUI,
-                              int   obtainType,        // emObtainGemType enum
-                              void *trackReason,       // String
-                              void *mi);
+typedef bool (*AddMaterial_t)(void *self, void *itemName, int count,
+                              void *source, bool save, int changeCoinReason,
+                              bool fromActivity, bool showMergeUI,
+                              int obtainType, void *trackReason, void *mi);
 static AddMaterial_t g_addmaterial = nullptr;
 
 // ConsumeMaterial overload A: argc 3
@@ -202,18 +191,8 @@ static ConsumeMat3_t g_consumemat3_orig;
 static void consumemat3_hook(void *self, void *itemName, int count, bool needRecord, void *mi) {
     static int logged = 0;
     if (logged < 20) { logged++; LOGI("ConsumeMaterial(3) flipped: count=%d", count); }
-    // Skip consume, add instead
-    if (g_addmaterial && self && itemName) {
-        g_addmaterial(self, itemName, count,
-                      nullptr,  // source = null
-                      false,    // save
-                      0,        // SeasonCoinChangeReason.Debug
-                      false,    // fromActivity
-                      false,    // showMergeUI
-                      0,        // emObtainGemType default
-                      nullptr,  // trackReason = null
-                      mi);
-    }
+    if (g_addmaterial && self && itemName)
+        g_addmaterial(self, itemName, count, nullptr, false, 0, false, false, 0, nullptr, mi);
 }
 
 // ConsumeMaterial overload B: argc 6
@@ -227,21 +206,36 @@ static void consumemat6_hook(void *self, void *itemName, int count,
                               void *trackReason, void *mi) {
     static int logged = 0;
     if (logged < 20) { logged++; LOGI("ConsumeMaterial(6) flipped: count=%d", count); }
-    if (g_addmaterial && self && itemName) {
-        g_addmaterial(self, itemName, count,
-                      nullptr,       // source = null
-                      save,          // honour original save flag
-                      0,             // SeasonCoinChangeReason.Debug
-                      fromActivity,  // honour original flag
-                      false,         // showMergeUI
-                      0,             // emObtainGemType default
-                      trackReason,   // pass through
-                      mi);
-    }
+    if (g_addmaterial && self && itemName)
+        g_addmaterial(self, itemName, count, nullptr, save, 0, fromActivity, false, 0, trackReason, mi);
 }
 
 // ---------------------------------------------------------
-// 8. Installer
+// 8. In-dungeon Currency Flip (RGGameProcess)
+//
+//    ConsumeCoin(Int32, emStatisticsType, ItemLevel)
+//    covers every in-dungeon coin type via ItemLevel enum.
+//    Flipped to call AddCoin(Int32, emObtainCoinType, ItemLevel)
+//    with the same count and currencyType.
+//    Both enums pass as 0 (default/debug value).
+// ---------------------------------------------------------
+typedef bool (*ConsumeCoin_t)(void *self, int count, int statisticsType, int currencyType, void *mi);
+static ConsumeCoin_t g_consumecoin_orig;
+
+typedef void (*AddCoin_t)(void *self, int count, int obtainType, int currencyType, void *mi);
+static AddCoin_t g_addcoin = nullptr;
+
+static bool consumecoin_hook(void *self, int count, int statisticsType, int currencyType, void *mi) {
+    static int logged = 0;
+    if (logged < 20) { logged++; LOGI("ConsumeCoin flipped: count=%d type=%d", count, currencyType); }
+    // Skip consume, add instead
+    if (g_addcoin && self)
+        g_addcoin(self, count, 0, currencyType, mi);
+    return true; // report success so callers don't block
+}
+
+// ---------------------------------------------------------
+// 9. Installer
 // ---------------------------------------------------------
 static void install(void *h) {
 #define S(n) xdl_sym(h, n, nullptr)
@@ -382,20 +376,18 @@ static void install(void *h) {
         }
     }
 
-    // --- ItemData: ConsumeMaterial flip ---
+    // --- ItemData: out-of-dungeon ConsumeMaterial flip ---
     {
         void *klass = class_from_name(image, "", "ItemData");
         if (!klass) {
             LOGE("hook: ItemData not found");
         } else {
-            // Resolve AddMaterial (argc 9) first — needed by both consume hooks
             void *mi_add = method_by_name(klass, "AddMaterial", 9);
             if (mi_add) {
                 g_addmaterial = (AddMaterial_t) *(void **) mi_add;
                 LOGI("hook: ItemData.AddMaterial @%p resolved", (void*)g_addmaterial);
             } else { LOGE("hook: AddMaterial not found in ItemData"); }
 
-            // ConsumeMaterial argc 3
             void *mi3 = method_by_name(klass, "ConsumeMaterial", 3);
             void *addr3 = mi3 ? *(void **) mi3 : nullptr;
             if (addr3) {
@@ -403,13 +395,35 @@ static void install(void *h) {
                 LOGI("hook: ItemData.ConsumeMaterial(3) @%p installed", addr3);
             } else { LOGE("hook: ConsumeMaterial(3) not found in ItemData"); }
 
-            // ConsumeMaterial argc 6
             void *mi6 = method_by_name(klass, "ConsumeMaterial", 6);
             void *addr6 = mi6 ? *(void **) mi6 : nullptr;
             if (addr6) {
                 A64HookFunction(addr6, (void *) consumemat6_hook, (void **) &g_consumemat6_orig);
                 LOGI("hook: ItemData.ConsumeMaterial(6) @%p installed", addr6);
             } else { LOGE("hook: ConsumeMaterial(6) not found in ItemData"); }
+        }
+    }
+
+    // --- RGGameProcess: in-dungeon ConsumeCoin flip ---
+    {
+        void *klass = class_from_name(image, "", "RGGameProcess");
+        if (!klass) {
+            LOGE("hook: RGGameProcess not found");
+        } else {
+            // Resolve AddCoin(Int32, emObtainCoinType, ItemLevel) — argc 3
+            void *mi_add = method_by_name(klass, "AddCoin", 3);
+            if (mi_add) {
+                g_addcoin = (AddCoin_t) *(void **) mi_add;
+                LOGI("hook: RGGameProcess.AddCoin @%p resolved", (void*)g_addcoin);
+            } else { LOGE("hook: AddCoin(3) not found in RGGameProcess"); }
+
+            // ConsumeCoin(Int32, emStatisticsType, ItemLevel) — argc 3
+            void *mi_con = method_by_name(klass, "ConsumeCoin", 3);
+            void *addr_con = mi_con ? *(void **) mi_con : nullptr;
+            if (addr_con) {
+                A64HookFunction(addr_con, (void *) consumecoin_hook, (void **) &g_consumecoin_orig);
+                LOGI("hook: RGGameProcess.ConsumeCoin @%p installed", addr_con);
+            } else { LOGE("hook: ConsumeCoin(3) not found in RGGameProcess"); }
         }
     }
 #endif
