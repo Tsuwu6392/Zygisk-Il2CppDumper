@@ -1,4 +1,7 @@
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <set>
 #include <thread>
 #include <unistd.h>
@@ -8,6 +11,29 @@
 #if defined(__aarch64__)
 extern "C" void A64HookFunction(void *symbol, void *replace, void **result);
 #endif
+
+// ---------------------------------------------------------
+// Live Config Reader: /data/local/tmp/sk_cd.txt
+// Write a float (e.g. 0.1 for 10% cooldown time).
+// Checked at most once per second — no rebuild or reboot needed.
+// ---------------------------------------------------------
+static float get_cd_factor() {
+    static float s_factor = 0.1f;
+    static time_t s_last_check = 0;
+    time_t now = time(nullptr);
+    if (now != s_last_check) {
+        s_last_check = now;
+        FILE *f = fopen("/data/local/tmp/sk_cd.txt", "r");
+        if (f) {
+            float val = 0.0f;
+            if (fscanf(f, "%f", &val) == 1 && val >= 0.0f && val <= 1.0f) {
+                s_factor = val;
+            }
+            fclose(f);
+        }
+    }
+    return s_factor;
+}
 
 // ---------------------------------------------------------
 // 1. HurtHp Hooks
@@ -136,23 +162,39 @@ static void setenergy_hook(void *self, int value, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 6. Skill Cooldown Reduction (RoleAttributePlayer.SetSkillReloadTime)
+// 6. Skill Cooldown Hooks (SkillInfo)
 //
-//    Hooks SetSkillReloadTime(Single t) — argc 1.
-//    Scales initial cooldown to 15% (e.g. 7.0s -> ~1.05s).
-//    Does NOT touch active buff duration or frame tick rates.
+//    Hook SkillInfo.get_FinalCooldown and CalculateFinalCooldown.
+//    Only scales cooldown time — never touches active buff duration.
 // ---------------------------------------------------------
-typedef void (*SetSkillReloadTime_t)(void *self, float t, void *mi);
-static SetSkillReloadTime_t g_setskillreloadtime_orig;
+typedef float (*GetFinalCd_t)(void *self, void *mi);
+static GetFinalCd_t g_getfinalcd_orig;
 
-static void setskillreloadtime_hook(void *self, float t, void *mi) {
+static float getfinalcd_hook(void *self, void *mi) {
     static int logged = 0;
-    float reduced = (t > 1.0f) ? (t * 0.15f) : t;
+    float raw = g_getfinalcd_orig(self, mi);
+    float factor = get_cd_factor();
+    float result = raw * factor;
     if (logged < 20) {
         logged++;
-        LOGI("SetSkillReloadTime: %.2f -> %.2f", t, reduced);
+        LOGI("SkillInfo.get_FinalCooldown: %.2f -> %.2f (factor=%.2f)", raw, result, factor);
     }
-    g_setskillreloadtime_orig(self, reduced, mi);
+    return result;
+}
+
+typedef float (*CalcFinalCd_t)(void *self, float cd, void *mi);
+static CalcFinalCd_t g_calcfinalcd_orig;
+
+static float calcfinalcd_hook(void *self, float cd, void *mi) {
+    static int logged = 0;
+    float raw = g_calcfinalcd_orig(self, cd, mi);
+    float factor = get_cd_factor();
+    float result = raw * factor;
+    if (logged < 20) {
+        logged++;
+        LOGI("SkillInfo.CalculateFinalCooldown: %.2f -> %.2f (factor=%.2f)", raw, result, factor);
+    }
+    return result;
 }
 
 // ---------------------------------------------------------
@@ -318,7 +360,7 @@ static void install(void *h) {
         }
     }
 
-    // --- RoleAttributePlayer: SetUpChar + set_energy + SetSkillReloadTime ---
+    // --- RoleAttributePlayer: SetUpChar + set_energy ---
     {
         void *klass = class_from_name(image, "", "RoleAttributePlayer");
         if (!klass) {
@@ -337,13 +379,28 @@ static void install(void *h) {
                 A64HookFunction(addr1, (void *) setenergy_hook, (void **) &g_setenergy_orig);
                 LOGI("hook: RoleAttributePlayer.set_energy @%p installed", addr1);
             } else { LOGE("hook: set_energy not found in RoleAttributePlayer"); }
+        }
+    }
 
-            void *mi_cd = method_by_name(klass, "SetSkillReloadTime", 1);
-            void *addr_cd = mi_cd ? *(void **) mi_cd : nullptr;
-            if (addr_cd) {
-                A64HookFunction(addr_cd, (void *) setskillreloadtime_hook, (void **) &g_setskillreloadtime_orig);
-                LOGI("hook: RoleAttributePlayer.SetSkillReloadTime @%p installed", addr_cd);
-            } else { LOGE("hook: SetSkillReloadTime not found in RoleAttributePlayer"); }
+    // --- SkillInfo: get_FinalCooldown + CalculateFinalCooldown ---
+    {
+        void *klass = class_from_name(image, "", "SkillInfo");
+        if (!klass) {
+            LOGE("hook: SkillInfo not found");
+        } else {
+            void *mi_final = method_by_name(klass, "get_FinalCooldown", 0);
+            void *addr_final = mi_final ? *(void **) mi_final : nullptr;
+            if (addr_final) {
+                A64HookFunction(addr_final, (void *) getfinalcd_hook, (void **) &g_getfinalcd_orig);
+                LOGI("hook: SkillInfo.get_FinalCooldown @%p installed", addr_final);
+            } else { LOGE("hook: get_FinalCooldown not found in SkillInfo"); }
+
+            void *mi_calc = method_by_name(klass, "CalculateFinalCooldown", 1);
+            void *addr_calc = mi_calc ? *(void **) mi_calc : nullptr;
+            if (addr_calc) {
+                A64HookFunction(addr_calc, (void *) calcfinalcd_hook, (void **) &g_calcfinalcd_orig);
+                LOGI("hook: SkillInfo.CalculateFinalCooldown @%p installed", addr_calc);
+            } else { LOGE("hook: CalculateFinalCooldown not found in SkillInfo"); }
         }
     }
 
