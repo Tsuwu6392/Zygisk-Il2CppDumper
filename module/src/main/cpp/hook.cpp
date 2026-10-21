@@ -14,8 +14,6 @@ extern "C" void A64HookFunction(void *symbol, void *replace, void **result);
 
 // ---------------------------------------------------------
 // Live Config Reader: /data/local/tmp/sk_cd.txt
-// Write a float (e.g. 0.15 for 15% cooldown time).
-// Checked at most once per second — no rebuild or reboot needed.
 // ---------------------------------------------------------
 static float get_cd_factor() {
     static float s_factor = 0.15f;
@@ -80,7 +78,41 @@ static void adddead_hook(void *self, void *src, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 3. Mall Hooks (Free In-Game Purchases)
+// 3. Debuff Immunity (Stun, Freeze, Burn, Shock, Poison)
+// ---------------------------------------------------------
+typedef int (*GetCamp_t)(void *self, void *mi);
+static GetCamp_t g_getcamp = nullptr;
+
+typedef void (*Dizzy_t)(void *self, float duration, bool isFreeze, void *mi);
+static Dizzy_t g_dizzy_orig;
+
+static void dizzy_hook(void *self, float duration, bool isFreeze, void *mi) {
+    if (self && g_getcamp) {
+        int camp = g_getcamp(self, mi);
+        if (camp == 0) {
+            LOGI("Dizzy blocked on player! duration=%.2f isFreeze=%d", duration, isFreeze);
+            return;
+        }
+    }
+    g_dizzy_orig(self, duration, isFreeze, mi);
+}
+
+typedef void (*PlayerAddRGBuff_t)(void *self, void *buff, void *mi);
+static PlayerAddRGBuff_t g_player_addrgbuff_orig;
+
+static void player_addrgbuff_hook(void *self, void *buff, void *mi) {
+    if (buff) {
+        bool is_debuff = *(bool *)((char *)buff + 0x78);
+        if (is_debuff) {
+            LOGI("RGBuff blocked on player (is_debuff=true)");
+            return;
+        }
+    }
+    g_player_addrgbuff_orig(self, buff, mi);
+}
+
+// ---------------------------------------------------------
+// 4. Mall Hooks (Free In-Game Purchases)
 // ---------------------------------------------------------
 typedef void (*BuyItem_t)(void *self, void *mallItem, void *onDone, void *mi);
 static BuyItem_t g_buyitem_orig;
@@ -104,7 +136,7 @@ static bool hasenough_hook(void *mallItem, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 4. RGSaveManager Hooks (Free Gem Purchases Outside Dungeon)
+// 5. RGSaveManager Hooks (Free Gem Purchases Outside Dungeon)
 // ---------------------------------------------------------
 typedef void (*ConsumeGem_t)(void *self, int amount, bool unk1, bool unk2, void *mi);
 static ConsumeGem_t g_consumegem_orig;
@@ -116,7 +148,7 @@ static void consumegem_hook(void *self, int amount, bool unk1, bool unk2, void *
 }
 
 // ---------------------------------------------------------
-// 5. Energy Hooks (RoleAttributePlayer)
+// 6. Energy Hooks (RoleAttributePlayer)
 // ---------------------------------------------------------
 static const int ENERGY_BONUS  = 1000;
 static const int ENERGY_REFILL = 100;
@@ -162,7 +194,7 @@ static void setenergy_hook(void *self, int value, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 6. Skill Cooldown Hooks (SkillInfo)
+// 7. Skill Cooldown Hooks (SkillInfo)
 // ---------------------------------------------------------
 typedef float (*GetFinalCd_t)(void *self, void *mi);
 static GetFinalCd_t g_getfinalcd_orig;
@@ -195,8 +227,7 @@ static float calcfinalcd_hook(void *self, float cd, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 7. No Change: Materials, Seeds, Vouchers, Fish Chips (ItemData)
-//    All deductions simply no-op -> balances never decrease.
+// 8. No Change: Materials, Seeds, Vouchers, Fish Chips (ItemData)
 // ---------------------------------------------------------
 typedef void (*ConsumeMat3_t)(void *self, void *itemName, int count, bool needRecord, void *mi);
 static ConsumeMat3_t g_consumemat3_orig;
@@ -243,7 +274,7 @@ static void consumefishcount_hook(void *self, int count, int obtainType, bool sa
 }
 
 // ---------------------------------------------------------
-// 8. Installer
+// 9. Installer
 // ---------------------------------------------------------
 static void install(void *h) {
 #define S(n) xdl_sym(h, n, nullptr)
@@ -296,6 +327,42 @@ static void install(void *h) {
     }
 
 #if defined(__aarch64__)
+    // --- RGBaseController: Dizzy (Stun & Freeze Immunity for Player) ---
+    {
+        void *klass = class_from_name(image, "", "RGBaseController");
+        if (!klass) {
+            LOGE("hook: RGBaseController not found");
+        } else {
+            void *mi_camp = method_by_name(klass, "get_camp", 0);
+            if (mi_camp) {
+                g_getcamp = (GetCamp_t) *(void **) mi_camp;
+                LOGI("hook: RGBaseController.get_camp @%p resolved", (void *)g_getcamp);
+            }
+
+            void *mi_dizzy = method_by_name(klass, "Dizzy", 2);
+            void *addr_dizzy = mi_dizzy ? *(void **) mi_dizzy : nullptr;
+            if (addr_dizzy) {
+                A64HookFunction(addr_dizzy, (void *) dizzy_hook, (void **) &g_dizzy_orig);
+                LOGI("hook: RGBaseController.Dizzy @%p installed", addr_dizzy);
+            } else { LOGE("hook: Dizzy not found"); }
+        }
+    }
+
+    // --- RGControllerTarget: AddBuff (Burn, Shock, Poison Immunity) ---
+    {
+        void *klass = class_from_name(image, "", "RGControllerTarget");
+        if (!klass) {
+            LOGE("hook: RGControllerTarget not found");
+        } else {
+            void *mi_buff = method_by_name(klass, "AddBuff", 1);
+            void *addr_buff = mi_buff ? *(void **) mi_buff : nullptr;
+            if (addr_buff) {
+                A64HookFunction(addr_buff, (void *) player_addrgbuff_hook, (void **) &g_player_addrgbuff_orig);
+                LOGI("hook: RGControllerTarget.AddBuff @%p installed", addr_buff);
+            } else { LOGE("hook: RGControllerTarget.AddBuff not found"); }
+        }
+    }
+
     // --- MallData ---
     {
         void *klass = class_from_name(image, "RGScript.Data.Mall", "MallData");
