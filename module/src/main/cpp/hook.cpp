@@ -90,14 +90,17 @@ static void consumegem_hook(void *self, int amount, bool unk1, bool unk2, void *
 }
 
 // ---------------------------------------------------------
-// 5. Energy Hooks (RoleAttributePlayer)
+// 5. Energy + Native Cooldown Factor Hooks (RoleAttributePlayer)
 //
-//    Fields:
-//      max_energy : Int32 @ +0x178
-//      _energy    : Int32 @ +0x17c
+//    Inherited from RoleAttribute:
+//      skillReloadSpeedFactor : Single @ +0x124
+//    RoleAttributePlayer:
+//      max_energy             : Int32  @ +0x178
+//      _energy                : Int32  @ +0x17c
 // ---------------------------------------------------------
-static const int ENERGY_BONUS  = 1000;
-static const int ENERGY_REFILL = 100;
+static const int ENERGY_BONUS       = 1000;
+static const int ENERGY_REFILL      = 100;
+static const float CD_SPEED_FACTOR  = 10.0f; // 10x native cooldown reload speed
 
 typedef void (*SetUpChar_t)(void *self, void *mi);
 static SetUpChar_t g_setupchar_orig;
@@ -105,12 +108,19 @@ static SetUpChar_t g_setupchar_orig;
 static void setupchar_hook(void *self, void *mi) {
     g_setupchar_orig(self, mi);
     if (!self) return;
+
+    // Boost max energy
     int *p_max = (int *)((char *)self + 0x178);
     int cur_max = *p_max;
     if (cur_max > 0 && cur_max < 10000) {
         *p_max = cur_max + ENERGY_BONUS;
         LOGI("energy: SetUpChar max %d -> %d", cur_max, *p_max);
     }
+
+    // Set native cooldown factor to 10.0f
+    float *p_factor = (float *)((char *)self + 0x124);
+    *p_factor = CD_SPEED_FACTOR;
+    LOGI("cooldown: SetUpChar skillReloadSpeedFactor set to %.2f", *p_factor);
 }
 
 typedef void (*SetEnergy_t)(void *self, int value, void *mi);
@@ -129,6 +139,12 @@ static void setenergy_hook(void *self, int value, void *mi) {
         if (logged < 20) { logged++; LOGI("energy: set_energy re-bumped max %d -> %d", cur_max, *p_max); }
     }
 
+    // Maintain native cooldown factor across resets
+    float *p_factor = (float *)((char *)self + 0x124);
+    if (*p_factor < CD_SPEED_FACTOR) {
+        *p_factor = CD_SPEED_FACTOR;
+    }
+
     g_setenergy_orig(self, value, mi);
 
     int after = *p_cur;
@@ -140,36 +156,7 @@ static void setenergy_hook(void *self, int value, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 6. Skill Cooldown Hook (RoleAttributePlayer)
-//
-//    Hook set_skillHaste(Single) — argc 1.
-//    Add +500 on top of every write the game makes.
-//    This mirrors exactly what the in-game SkillCd buff
-//    does, just with a permanent bonus.
-//    Weapon switch re-calls set_skillHaste naturally,
-//    so the bonus re-applies automatically — no timer
-//    manipulation, no side effects on buff duration.
-// ---------------------------------------------------------
-static const float SKILL_HASTE_BONUS = 500.0f;
-
-typedef void (*SetSkillHaste_t)(void *self, float value, void *mi);
-static SetSkillHaste_t g_setskillhaste_orig;
-
-static void setskillhaste_hook(void *self, float value, void *mi) {
-    static int logged = 0;
-    float boosted = value + SKILL_HASTE_BONUS;
-    if (logged < 20) {
-        logged++;
-        LOGI("set_skillHaste: %.2f -> %.2f", value, boosted);
-    }
-    g_setskillhaste_orig(self, boosted, mi);
-}
-
-// ---------------------------------------------------------
-// 7. Out-of-dungeon Currency Flip (ItemData)
-//
-//    ConsumeMaterial flipped to AddMaterial.
-//    Covers SeasonCoin and other persistent currencies.
+// 6. Out-of-dungeon Currency Flip (ItemData)
 // ---------------------------------------------------------
 typedef bool (*AddMaterial_t)(void *self, void *itemName, int count,
                               void *source, bool save, int changeCoinReason,
@@ -202,11 +189,7 @@ static void consumemat6_hook(void *self, void *itemName, int count,
 }
 
 // ---------------------------------------------------------
-// 8. Fish Chip Flip (ItemData)
-//
-//    ConsumeFishCount(Int32, emStatisticsType, Boolean)
-//    flipped to AddFishCount(Int32, emObtainGemType, Boolean).
-//    Turns every fish chip spend into a gain.
+// 7. Fish Chip Flip (ItemData)
 // ---------------------------------------------------------
 typedef void (*AddFishCount_t)(void *self, int count, int obtainType, bool save, void *mi);
 static AddFishCount_t g_addfishcount = nullptr;
@@ -216,13 +199,14 @@ static ConsumeFishCount_t g_consumefishcount_orig;
 
 static void consumefishcount_hook(void *self, int count, int obtainType, bool save, void *mi) {
     static int logged = 0;
-    if (logged < 20) { logged++; LOGI("ConsumeFishCount flipped: count=%d", count); }
+    int gain = (count > 0) ? count : 10;
+    if (logged < 20) { logged++; LOGI("ConsumeFishCount flipped: raw_count=%d -> adding %d", count, gain); }
     if (g_addfishcount && self)
-        g_addfishcount(self, count, 0, save, mi);
+        g_addfishcount(self, gain, 0, save, mi);
 }
 
 // ---------------------------------------------------------
-// 9. Installer
+// 8. Installer
 // ---------------------------------------------------------
 static void install(void *h) {
 #define S(n) xdl_sym(h, n, nullptr)
@@ -334,13 +318,12 @@ static void install(void *h) {
         }
     }
 
-    // --- RoleAttributePlayer: SetUpChar + set_energy + set_skillHaste ---
+    // --- RoleAttributePlayer: SetUpChar + set_energy ---
     {
         void *klass = class_from_name(image, "", "RoleAttributePlayer");
         if (!klass) {
             LOGE("hook: RoleAttributePlayer not found");
         } else {
-            // SetUpChar — argc 0
             void *mi0 = method_by_name(klass, "SetUpChar", 0);
             void *addr0 = mi0 ? *(void **) mi0 : nullptr;
             if (addr0) {
@@ -348,22 +331,12 @@ static void install(void *h) {
                 LOGI("hook: RoleAttributePlayer.SetUpChar @%p installed", addr0);
             } else { LOGE("hook: SetUpChar not found in RoleAttributePlayer"); }
 
-            // set_energy — argc 1
             void *mi1 = method_by_name(klass, "set_energy", 1);
             void *addr1 = mi1 ? *(void **) mi1 : nullptr;
             if (addr1) {
                 A64HookFunction(addr1, (void *) setenergy_hook, (void **) &g_setenergy_orig);
                 LOGI("hook: RoleAttributePlayer.set_energy @%p installed", addr1);
             } else { LOGE("hook: set_energy not found in RoleAttributePlayer"); }
-
-            // set_skillHaste — argc 1
-            // Replaces SkillReload hook — no timer side effects
-            void *mi2 = method_by_name(klass, "set_skillHaste", 1);
-            void *addr2 = mi2 ? *(void **) mi2 : nullptr;
-            if (addr2) {
-                A64HookFunction(addr2, (void *) setskillhaste_hook, (void **) &g_setskillhaste_orig);
-                LOGI("hook: RoleAttributePlayer.set_skillHaste @%p installed", addr2);
-            } else { LOGE("hook: set_skillHaste not found in RoleAttributePlayer"); }
         }
     }
 
@@ -373,14 +346,12 @@ static void install(void *h) {
         if (!klass) {
             LOGE("hook: ItemData not found");
         } else {
-            // AddMaterial (argc 9) — resolved for use by ConsumeMaterial hooks
             void *mi_addmat = method_by_name(klass, "AddMaterial", 9);
             if (mi_addmat) {
                 g_addmaterial = (AddMaterial_t) *(void **) mi_addmat;
                 LOGI("hook: ItemData.AddMaterial @%p resolved", (void*)g_addmaterial);
             } else { LOGE("hook: AddMaterial not found in ItemData"); }
 
-            // ConsumeMaterial argc 3
             void *mi3 = method_by_name(klass, "ConsumeMaterial", 3);
             void *addr3 = mi3 ? *(void **) mi3 : nullptr;
             if (addr3) {
@@ -388,7 +359,6 @@ static void install(void *h) {
                 LOGI("hook: ItemData.ConsumeMaterial(3) @%p installed", addr3);
             } else { LOGE("hook: ConsumeMaterial(3) not found in ItemData"); }
 
-            // ConsumeMaterial argc 6
             void *mi6 = method_by_name(klass, "ConsumeMaterial", 6);
             void *addr6 = mi6 ? *(void **) mi6 : nullptr;
             if (addr6) {
@@ -396,14 +366,12 @@ static void install(void *h) {
                 LOGI("hook: ItemData.ConsumeMaterial(6) @%p installed", addr6);
             } else { LOGE("hook: ConsumeMaterial(6) not found in ItemData"); }
 
-            // AddFishCount (argc 3) — resolved for use by ConsumeFishCount hook
             void *mi_addfish = method_by_name(klass, "AddFishCount", 3);
             if (mi_addfish) {
                 g_addfishcount = (AddFishCount_t) *(void **) mi_addfish;
                 LOGI("hook: ItemData.AddFishCount @%p resolved", (void*)g_addfishcount);
             } else { LOGE("hook: AddFishCount not found in ItemData"); }
 
-            // ConsumeFishCount argc 3
             void *mi_fish = method_by_name(klass, "ConsumeFishCount", 3);
             void *addr_fish = mi_fish ? *(void **) mi_fish : nullptr;
             if (addr_fish) {
