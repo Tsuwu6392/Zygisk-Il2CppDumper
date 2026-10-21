@@ -90,17 +90,10 @@ static void consumegem_hook(void *self, int amount, bool unk1, bool unk2, void *
 }
 
 // ---------------------------------------------------------
-// 5. Energy + Native Cooldown Factor Hooks (RoleAttributePlayer)
-//
-//    Inherited from RoleAttribute:
-//      skillReloadSpeedFactor : Single @ +0x124
-//    RoleAttributePlayer:
-//      max_energy             : Int32  @ +0x178
-//      _energy                : Int32  @ +0x17c
+// 5. Energy Hooks (RoleAttributePlayer)
 // ---------------------------------------------------------
-static const int ENERGY_BONUS       = 1000;
-static const int ENERGY_REFILL      = 100;
-static const float CD_SPEED_FACTOR  = 10.0f; // 10x native cooldown reload speed
+static const int ENERGY_BONUS  = 1000;
+static const int ENERGY_REFILL = 100;
 
 typedef void (*SetUpChar_t)(void *self, void *mi);
 static SetUpChar_t g_setupchar_orig;
@@ -108,19 +101,12 @@ static SetUpChar_t g_setupchar_orig;
 static void setupchar_hook(void *self, void *mi) {
     g_setupchar_orig(self, mi);
     if (!self) return;
-
-    // Boost max energy
     int *p_max = (int *)((char *)self + 0x178);
     int cur_max = *p_max;
     if (cur_max > 0 && cur_max < 10000) {
         *p_max = cur_max + ENERGY_BONUS;
         LOGI("energy: SetUpChar max %d -> %d", cur_max, *p_max);
     }
-
-    // Set native cooldown factor to 10.0f
-    float *p_factor = (float *)((char *)self + 0x124);
-    *p_factor = CD_SPEED_FACTOR;
-    LOGI("cooldown: SetUpChar skillReloadSpeedFactor set to %.2f", *p_factor);
 }
 
 typedef void (*SetEnergy_t)(void *self, int value, void *mi);
@@ -139,12 +125,6 @@ static void setenergy_hook(void *self, int value, void *mi) {
         if (logged < 20) { logged++; LOGI("energy: set_energy re-bumped max %d -> %d", cur_max, *p_max); }
     }
 
-    // Maintain native cooldown factor across resets
-    float *p_factor = (float *)((char *)self + 0x124);
-    if (*p_factor < CD_SPEED_FACTOR) {
-        *p_factor = CD_SPEED_FACTOR;
-    }
-
     g_setenergy_orig(self, value, mi);
 
     int after = *p_cur;
@@ -156,7 +136,27 @@ static void setenergy_hook(void *self, int value, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 6. Out-of-dungeon Currency Flip (ItemData)
+// 6. Skill Cooldown Reduction (RoleAttributePlayer.SetSkillReloadTime)
+//
+//    Hooks SetSkillReloadTime(Single t) — argc 1.
+//    Scales initial cooldown to 15% (e.g. 7.0s -> ~1.05s).
+//    Does NOT touch active buff duration or frame tick rates.
+// ---------------------------------------------------------
+typedef void (*SetSkillReloadTime_t)(void *self, float t, void *mi);
+static SetSkillReloadTime_t g_setskillreloadtime_orig;
+
+static void setskillreloadtime_hook(void *self, float t, void *mi) {
+    static int logged = 0;
+    float reduced = (t > 1.0f) ? (t * 0.15f) : t;
+    if (logged < 20) {
+        logged++;
+        LOGI("SetSkillReloadTime: %.2f -> %.2f", t, reduced);
+    }
+    g_setskillreloadtime_orig(self, reduced, mi);
+}
+
+// ---------------------------------------------------------
+// 7. Out-of-dungeon Currency Flip (ItemData)
 // ---------------------------------------------------------
 typedef bool (*AddMaterial_t)(void *self, void *itemName, int count,
                               void *source, bool save, int changeCoinReason,
@@ -189,7 +189,7 @@ static void consumemat6_hook(void *self, void *itemName, int count,
 }
 
 // ---------------------------------------------------------
-// 7. Fish Chip Flip (ItemData)
+// 8. Fish Chip Flip (ItemData)
 // ---------------------------------------------------------
 typedef void (*AddFishCount_t)(void *self, int count, int obtainType, bool save, void *mi);
 static AddFishCount_t g_addfishcount = nullptr;
@@ -199,14 +199,14 @@ static ConsumeFishCount_t g_consumefishcount_orig;
 
 static void consumefishcount_hook(void *self, int count, int obtainType, bool save, void *mi) {
     static int logged = 0;
-    int gain = (count > 0) ? count : 10;
-    if (logged < 20) { logged++; LOGI("ConsumeFishCount flipped: raw_count=%d -> adding %d", count, gain); }
-    if (g_addfishcount && self)
-        g_addfishcount(self, gain, 0, save, mi);
+    if (logged < 20) { logged++; LOGI("ConsumeFishCount called: count=%d", count); }
+    if (count > 0 && g_addfishcount && self) {
+        g_addfishcount(self, count, 0, save, mi);
+    }
 }
 
 // ---------------------------------------------------------
-// 8. Installer
+// 9. Installer
 // ---------------------------------------------------------
 static void install(void *h) {
 #define S(n) xdl_sym(h, n, nullptr)
@@ -318,7 +318,7 @@ static void install(void *h) {
         }
     }
 
-    // --- RoleAttributePlayer: SetUpChar + set_energy ---
+    // --- RoleAttributePlayer: SetUpChar + set_energy + SetSkillReloadTime ---
     {
         void *klass = class_from_name(image, "", "RoleAttributePlayer");
         if (!klass) {
@@ -337,6 +337,13 @@ static void install(void *h) {
                 A64HookFunction(addr1, (void *) setenergy_hook, (void **) &g_setenergy_orig);
                 LOGI("hook: RoleAttributePlayer.set_energy @%p installed", addr1);
             } else { LOGE("hook: set_energy not found in RoleAttributePlayer"); }
+
+            void *mi_cd = method_by_name(klass, "SetSkillReloadTime", 1);
+            void *addr_cd = mi_cd ? *(void **) mi_cd : nullptr;
+            if (addr_cd) {
+                A64HookFunction(addr_cd, (void *) setskillreloadtime_hook, (void **) &g_setskillreloadtime_orig);
+                LOGI("hook: RoleAttributePlayer.SetSkillReloadTime @%p installed", addr_cd);
+            } else { LOGE("hook: SetSkillReloadTime not found in RoleAttributePlayer"); }
         }
     }
 
