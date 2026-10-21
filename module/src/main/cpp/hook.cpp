@@ -144,10 +144,8 @@ static void setenergy_hook(void *self, int value, void *mi) {
 //
 //    SkillReload(Single deltaTime) — argc 1.
 //    Multiplies deltaTime by 10 for faster cooldown.
-//
-//    this_skill_time @ +0x1a0 is the active buff/skill
-//    duration timer — saved before and restored after the
-//    boosted call so buff durations are unaffected.
+//    Saves/restores this_skill_time @ +0x1a0 so active
+//    buff/skill durations are unaffected.
 // ---------------------------------------------------------
 typedef void (*SkillReload_t)(void *self, float deltaTime, void *mi);
 static SkillReload_t g_skillreload_orig;
@@ -156,18 +154,18 @@ static void skillreload_hook(void *self, float deltaTime, void *mi) {
     static int logged = 0;
     if (!self) { g_skillreload_orig(self, deltaTime, mi); return; }
 
-    // Save active skill duration timer before boosted tick
     float *p_skill_time = (float *)((char *)self + 0x1a0);
     float saved_skill_time = *p_skill_time;
 
     if (logged < 20 && deltaTime > 0.0f) {
         logged++;
-        LOGI("SkillReload: dt=%.4f -> %.4f skill_time=%.4f", deltaTime, deltaTime * 10.0f, saved_skill_time);
+        LOGI("SkillReload: dt=%.4f -> %.4f skill_time=%.4f",
+             deltaTime, deltaTime * 10.0f, saved_skill_time);
     }
 
     g_skillreload_orig(self, deltaTime * 10.0f, mi);
 
-    // Restore so active buff/skill duration is unaffected
+    // Restore active buff/skill duration timer
     *p_skill_time = saved_skill_time;
 }
 
@@ -213,11 +211,12 @@ static void consumemat6_hook(void *self, void *itemName, int count,
 // ---------------------------------------------------------
 // 8. In-dungeon Currency Flip (RGGameProcess)
 //
-//    ConsumeCoin(Int32, emStatisticsType, ItemLevel)
-//    covers every in-dungeon coin type via ItemLevel enum.
-//    Flipped to call AddCoin(Int32, emObtainCoinType, ItemLevel)
-//    with the same count and currencyType.
-//    Both enums pass as 0 (default/debug value).
+//    ConsumeCoin(Int32 count, emStatisticsType, ItemLevel)
+//    Whitelisted by ItemLevel enum:
+//      100 = GoldCoin,  102 = StarCoin,  104 = SeasonCoin
+//      106 = FireCoin,  107 = VoidCoin,  108 = VoidEye
+//      109 = ElementCoin
+//    All other types pass through untouched.
 // ---------------------------------------------------------
 typedef bool (*ConsumeCoin_t)(void *self, int count, int statisticsType, int currencyType, void *mi);
 static ConsumeCoin_t g_consumecoin_orig;
@@ -225,13 +224,19 @@ static ConsumeCoin_t g_consumecoin_orig;
 typedef void (*AddCoin_t)(void *self, int count, int obtainType, int currencyType, void *mi);
 static AddCoin_t g_addcoin = nullptr;
 
+static bool is_coin_type(int t) {
+    return t == 100 || t == 102 || t == 104 ||
+           t == 106 || t == 107 || t == 108 || t == 109;
+}
+
 static bool consumecoin_hook(void *self, int count, int statisticsType, int currencyType, void *mi) {
     static int logged = 0;
+    if (!is_coin_type(currencyType))
+        return g_consumecoin_orig(self, count, statisticsType, currencyType, mi);
     if (logged < 20) { logged++; LOGI("ConsumeCoin flipped: count=%d type=%d", count, currencyType); }
-    // Skip consume, add instead
     if (g_addcoin && self)
         g_addcoin(self, count, 0, currencyType, mi);
-    return true; // report success so callers don't block
+    return true;
 }
 
 // ---------------------------------------------------------
@@ -410,14 +415,12 @@ static void install(void *h) {
         if (!klass) {
             LOGE("hook: RGGameProcess not found");
         } else {
-            // Resolve AddCoin(Int32, emObtainCoinType, ItemLevel) — argc 3
             void *mi_add = method_by_name(klass, "AddCoin", 3);
             if (mi_add) {
                 g_addcoin = (AddCoin_t) *(void **) mi_add;
                 LOGI("hook: RGGameProcess.AddCoin @%p resolved", (void*)g_addcoin);
             } else { LOGE("hook: AddCoin(3) not found in RGGameProcess"); }
 
-            // ConsumeCoin(Int32, emStatisticsType, ItemLevel) — argc 3
             void *mi_con = method_by_name(klass, "ConsumeCoin", 3);
             void *addr_con = mi_con ? *(void **) mi_con : nullptr;
             if (addr_con) {
