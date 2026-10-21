@@ -14,11 +14,11 @@ extern "C" void A64HookFunction(void *symbol, void *replace, void **result);
 
 // ---------------------------------------------------------
 // Live Config Reader: /data/local/tmp/sk_cd.txt
-// Write a float (e.g. 0.1 for 10% cooldown time).
+// Write a float (e.g. 0.15 for 15% cooldown time).
 // Checked at most once per second — no rebuild or reboot needed.
 // ---------------------------------------------------------
 static float get_cd_factor() {
-    static float s_factor = 0.1f;
+    static float s_factor = 0.15f;
     static time_t s_last_check = 0;
     time_t now = time(nullptr);
     if (now != s_last_check) {
@@ -36,7 +36,7 @@ static float get_cd_factor() {
 }
 
 // ---------------------------------------------------------
-// 1. HurtHp Hooks
+// 1. HurtHp Hooks (God Mode)
 // ---------------------------------------------------------
 typedef void (*HurtHp_t)(void *self, int damage, void *src, void *mi);
 static HurtHp_t g_orig[3];
@@ -54,7 +54,7 @@ static void hurt_hook(void *self, int damage, void *src, void *mi) {
 static void *const g_repl[3] = {(void *) hurt_hook<0>, (void *) hurt_hook<1>, (void *) hurt_hook<2>};
 
 // ---------------------------------------------------------
-// 2. VoidShield Hooks
+// 2. VoidShield Hooks (Infinite Shield + No Instadeath)
 // ---------------------------------------------------------
 typedef bool (*Consume_t)(void *self, void *ev, void *mi);
 static Consume_t g_consume_orig;
@@ -80,7 +80,7 @@ static void adddead_hook(void *self, void *src, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 3. Mall Hooks (Price = 0, Currency = True)
+// 3. Mall Hooks (Free In-Game Purchases)
 // ---------------------------------------------------------
 typedef void (*BuyItem_t)(void *self, void *mallItem, void *onDone, void *mi);
 static BuyItem_t g_buyitem_orig;
@@ -104,7 +104,7 @@ static bool hasenough_hook(void *mallItem, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 4. RGSaveManager Hooks (Outside Shop / Batch)
+// 4. RGSaveManager Hooks (Free Gem Purchases Outside Dungeon)
 // ---------------------------------------------------------
 typedef void (*ConsumeGem_t)(void *self, int amount, bool unk1, bool unk2, void *mi);
 static ConsumeGem_t g_consumegem_orig;
@@ -163,9 +163,6 @@ static void setenergy_hook(void *self, int value, void *mi) {
 
 // ---------------------------------------------------------
 // 6. Skill Cooldown Hooks (SkillInfo)
-//
-//    Hook SkillInfo.get_FinalCooldown and CalculateFinalCooldown.
-//    Only scales cooldown time — never touches active buff duration.
 // ---------------------------------------------------------
 typedef float (*GetFinalCd_t)(void *self, void *mi);
 static GetFinalCd_t g_getfinalcd_orig;
@@ -198,22 +195,15 @@ static float calcfinalcd_hook(void *self, float cd, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 7. Out-of-dungeon Currency Flip (ItemData)
+// 7. No Change: Materials, Seeds, Vouchers, Fish Chips (ItemData)
+//    All deductions simply no-op -> balances never decrease.
 // ---------------------------------------------------------
-typedef bool (*AddMaterial_t)(void *self, void *itemName, int count,
-                              void *source, bool save, int changeCoinReason,
-                              bool fromActivity, bool showMergeUI,
-                              int obtainType, void *trackReason, void *mi);
-static AddMaterial_t g_addmaterial = nullptr;
-
 typedef void (*ConsumeMat3_t)(void *self, void *itemName, int count, bool needRecord, void *mi);
 static ConsumeMat3_t g_consumemat3_orig;
 
 static void consumemat3_hook(void *self, void *itemName, int count, bool needRecord, void *mi) {
     static int logged = 0;
-    if (logged < 20) { logged++; LOGI("ConsumeMaterial(3) flipped: count=%d", count); }
-    if (g_addmaterial && self && itemName)
-        g_addmaterial(self, itemName, count, nullptr, false, 0, false, false, 0, nullptr, mi);
+    if (logged < 20) { logged++; LOGI("ConsumeMaterial(3) blocked: count=%d (no loss)", count); }
 }
 
 typedef void (*ConsumeMat6_t)(void *self, void *itemName, int count,
@@ -225,30 +215,35 @@ static void consumemat6_hook(void *self, void *itemName, int count,
                               bool save, bool needRecord, bool fromActivity,
                               void *trackReason, void *mi) {
     static int logged = 0;
-    if (logged < 20) { logged++; LOGI("ConsumeMaterial(6) flipped: count=%d", count); }
-    if (g_addmaterial && self && itemName)
-        g_addmaterial(self, itemName, count, nullptr, save, 0, fromActivity, false, 0, trackReason, mi);
+    if (logged < 20) { logged++; LOGI("ConsumeMaterial(6) blocked: count=%d (no loss)", count); }
 }
 
-// ---------------------------------------------------------
-// 8. Fish Chip Flip (ItemData)
-// ---------------------------------------------------------
-typedef void (*AddFishCount_t)(void *self, int count, int obtainType, bool save, void *mi);
-static AddFishCount_t g_addfishcount = nullptr;
+typedef void (*ConsumeSeed_t)(void *self, void *itemName, void *mi);
+static ConsumeSeed_t g_consumeseed_orig;
+
+static void consumeseed_hook(void *self, void *itemName, void *mi) {
+    static int logged = 0;
+    if (logged < 20) { logged++; LOGI("ConsumeSeed blocked: infinite seeds"); }
+}
+
+typedef void (*ConsumeTicket_t)(void *self, void *itemName, int count, void *mi);
+static ConsumeTicket_t g_consumeticket_orig;
+
+static void consumeticket_hook(void *self, void *itemName, int count, void *mi) {
+    static int logged = 0;
+    if (logged < 20) { logged++; LOGI("ConsumeTokenTicket blocked: count=%d (infinite vouchers)", count); }
+}
 
 typedef void (*ConsumeFishCount_t)(void *self, int count, int obtainType, bool save, void *mi);
 static ConsumeFishCount_t g_consumefishcount_orig;
 
 static void consumefishcount_hook(void *self, int count, int obtainType, bool save, void *mi) {
     static int logged = 0;
-    if (logged < 20) { logged++; LOGI("ConsumeFishCount called: count=%d", count); }
-    if (count > 0 && g_addfishcount && self) {
-        g_addfishcount(self, count, 0, save, mi);
-    }
+    if (logged < 20) { logged++; LOGI("ConsumeFishCount blocked: count=%d (no loss)", count); }
 }
 
 // ---------------------------------------------------------
-// 9. Installer
+// 8. Installer
 // ---------------------------------------------------------
 static void install(void *h) {
 #define S(n) xdl_sym(h, n, nullptr)
@@ -404,18 +399,12 @@ static void install(void *h) {
         }
     }
 
-    // --- ItemData: ConsumeMaterial flip + ConsumeFishCount flip ---
+    // --- ItemData: Materials, Seeds, Vouchers, Fish Chips (All No-Op) ---
     {
         void *klass = class_from_name(image, "", "ItemData");
         if (!klass) {
             LOGE("hook: ItemData not found");
         } else {
-            void *mi_addmat = method_by_name(klass, "AddMaterial", 9);
-            if (mi_addmat) {
-                g_addmaterial = (AddMaterial_t) *(void **) mi_addmat;
-                LOGI("hook: ItemData.AddMaterial @%p resolved", (void*)g_addmaterial);
-            } else { LOGE("hook: AddMaterial not found in ItemData"); }
-
             void *mi3 = method_by_name(klass, "ConsumeMaterial", 3);
             void *addr3 = mi3 ? *(void **) mi3 : nullptr;
             if (addr3) {
@@ -430,11 +419,19 @@ static void install(void *h) {
                 LOGI("hook: ItemData.ConsumeMaterial(6) @%p installed", addr6);
             } else { LOGE("hook: ConsumeMaterial(6) not found in ItemData"); }
 
-            void *mi_addfish = method_by_name(klass, "AddFishCount", 3);
-            if (mi_addfish) {
-                g_addfishcount = (AddFishCount_t) *(void **) mi_addfish;
-                LOGI("hook: ItemData.AddFishCount @%p resolved", (void*)g_addfishcount);
-            } else { LOGE("hook: AddFishCount not found in ItemData"); }
+            void *mi_seed = method_by_name(klass, "ConsumeSeed", 1);
+            void *addr_seed = mi_seed ? *(void **) mi_seed : nullptr;
+            if (addr_seed) {
+                A64HookFunction(addr_seed, (void *) consumeseed_hook, (void **) &g_consumeseed_orig);
+                LOGI("hook: ItemData.ConsumeSeed @%p installed", addr_seed);
+            } else { LOGE("hook: ConsumeSeed not found in ItemData"); }
+
+            void *mi_ticket = method_by_name(klass, "ConsumeTokenTicket", 2);
+            void *addr_ticket = mi_ticket ? *(void **) mi_ticket : nullptr;
+            if (addr_ticket) {
+                A64HookFunction(addr_ticket, (void *) consumeticket_hook, (void **) &g_consumeticket_orig);
+                LOGI("hook: ItemData.ConsumeTokenTicket @%p installed", addr_ticket);
+            } else { LOGE("hook: ConsumeTokenTicket not found in ItemData"); }
 
             void *mi_fish = method_by_name(klass, "ConsumeFishCount", 3);
             void *addr_fish = mi_fish ? *(void **) mi_fish : nullptr;
