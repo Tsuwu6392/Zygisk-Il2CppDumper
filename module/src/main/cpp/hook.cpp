@@ -24,9 +24,8 @@ static float get_cd_factor() {
         FILE *f = fopen("/data/local/tmp/sk_cd.txt", "r");
         if (f) {
             float val = 0.0f;
-            if (fscanf(f, "%f", &val) == 1 && val >= 0.0f && val <= 1.0f) {
+            if (fscanf(f, "%f", &val) == 1 && val >= 0.0f && val <= 1.0f)
                 s_factor = val;
-            }
             fclose(f);
         }
     }
@@ -78,41 +77,7 @@ static void adddead_hook(void *self, void *src, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 3. Debuff Immunity (Stun, Freeze, Burn, Shock, Poison)
-// ---------------------------------------------------------
-typedef int (*GetCamp_t)(void *self, void *mi);
-static GetCamp_t g_getcamp = nullptr;
-
-typedef void (*Dizzy_t)(void *self, float duration, bool isFreeze, void *mi);
-static Dizzy_t g_dizzy_orig;
-
-static void dizzy_hook(void *self, float duration, bool isFreeze, void *mi) {
-    if (self && g_getcamp) {
-        int camp = g_getcamp(self, mi);
-        if (camp == 0) {
-            LOGI("Dizzy blocked on player! duration=%.2f isFreeze=%d", duration, isFreeze);
-            return;
-        }
-    }
-    g_dizzy_orig(self, duration, isFreeze, mi);
-}
-
-typedef void (*PlayerAddRGBuff_t)(void *self, void *buff, void *mi);
-static PlayerAddRGBuff_t g_player_addrgbuff_orig;
-
-static void player_addrgbuff_hook(void *self, void *buff, void *mi) {
-    if (buff) {
-        bool is_debuff = *(bool *)((char *)buff + 0x78);
-        if (is_debuff) {
-            LOGI("RGBuff blocked on player (is_debuff=true)");
-            return;
-        }
-    }
-    g_player_addrgbuff_orig(self, buff, mi);
-}
-
-// ---------------------------------------------------------
-// 4. Mall Hooks (Free In-Game Purchases)
+// 3. Mall Hooks (Free In-Game Purchases)
 // ---------------------------------------------------------
 typedef void (*BuyItem_t)(void *self, void *mallItem, void *onDone, void *mi);
 static BuyItem_t g_buyitem_orig;
@@ -136,7 +101,7 @@ static bool hasenough_hook(void *mallItem, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 5. RGSaveManager Hooks (Free Gem Purchases Outside Dungeon)
+// 4. RGSaveManager Hooks (Free Gem Purchases Outside Dungeon)
 // ---------------------------------------------------------
 typedef void (*ConsumeGem_t)(void *self, int amount, bool unk1, bool unk2, void *mi);
 static ConsumeGem_t g_consumegem_orig;
@@ -148,7 +113,7 @@ static void consumegem_hook(void *self, int amount, bool unk1, bool unk2, void *
 }
 
 // ---------------------------------------------------------
-// 6. Energy Hooks (RoleAttributePlayer)
+// 5. Energy Hooks (RoleAttributePlayer)
 // ---------------------------------------------------------
 static const int ENERGY_BONUS  = 1000;
 static const int ENERGY_REFILL = 100;
@@ -194,7 +159,7 @@ static void setenergy_hook(void *self, int value, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 7. Skill Cooldown Hooks (SkillInfo)
+// 6. Skill Cooldown Hooks (SkillInfo)
 // ---------------------------------------------------------
 typedef float (*GetFinalCd_t)(void *self, void *mi);
 static GetFinalCd_t g_getfinalcd_orig;
@@ -204,10 +169,7 @@ static float getfinalcd_hook(void *self, void *mi) {
     float raw = g_getfinalcd_orig(self, mi);
     float factor = get_cd_factor();
     float result = raw * factor;
-    if (logged < 20) {
-        logged++;
-        LOGI("SkillInfo.get_FinalCooldown: %.2f -> %.2f (factor=%.2f)", raw, result, factor);
-    }
+    if (logged < 20) { logged++; LOGI("SkillInfo.get_FinalCooldown: %.2f -> %.2f (factor=%.2f)", raw, result, factor); }
     return result;
 }
 
@@ -219,62 +181,80 @@ static float calcfinalcd_hook(void *self, float cd, void *mi) {
     float raw = g_calcfinalcd_orig(self, cd, mi);
     float factor = get_cd_factor();
     float result = raw * factor;
-    if (logged < 20) {
-        logged++;
-        LOGI("SkillInfo.CalculateFinalCooldown: %.2f -> %.2f (factor=%.2f)", raw, result, factor);
-    }
+    if (logged < 20) { logged++; LOGI("SkillInfo.CalculateFinalCooldown: %.2f -> %.2f (factor=%.2f)", raw, result, factor); }
     return result;
 }
 
 // ---------------------------------------------------------
-// 8. No Change: Materials, Seeds, Vouchers, Fish Chips (ItemData)
+// 7. No Change: Materials, Seeds, Vouchers, Fish Chips (ItemData)
 // ---------------------------------------------------------
 typedef void (*ConsumeMat3_t)(void *self, void *itemName, int count, bool needRecord, void *mi);
 static ConsumeMat3_t g_consumemat3_orig;
-
 static void consumemat3_hook(void *self, void *itemName, int count, bool needRecord, void *mi) {
     static int logged = 0;
-    if (logged < 20) { logged++; LOGI("ConsumeMaterial(3) blocked: count=%d (no loss)", count); }
+    if (logged < 20) { logged++; LOGI("ConsumeMaterial(3) blocked: count=%d", count); }
 }
 
 typedef void (*ConsumeMat6_t)(void *self, void *itemName, int count,
                                bool save, bool needRecord, bool fromActivity,
                                void *trackReason, void *mi);
 static ConsumeMat6_t g_consumemat6_orig;
-
 static void consumemat6_hook(void *self, void *itemName, int count,
                               bool save, bool needRecord, bool fromActivity,
                               void *trackReason, void *mi) {
     static int logged = 0;
-    if (logged < 20) { logged++; LOGI("ConsumeMaterial(6) blocked: count=%d (no loss)", count); }
+    if (logged < 20) { logged++; LOGI("ConsumeMaterial(6) blocked: count=%d", count); }
 }
 
 typedef void (*ConsumeSeed_t)(void *self, void *itemName, void *mi);
 static ConsumeSeed_t g_consumeseed_orig;
-
 static void consumeseed_hook(void *self, void *itemName, void *mi) {
     static int logged = 0;
-    if (logged < 20) { logged++; LOGI("ConsumeSeed blocked: infinite seeds"); }
+    if (logged < 20) { logged++; LOGI("ConsumeSeed blocked"); }
 }
 
 typedef void (*ConsumeTicket_t)(void *self, void *itemName, int count, void *mi);
 static ConsumeTicket_t g_consumeticket_orig;
-
 static void consumeticket_hook(void *self, void *itemName, int count, void *mi) {
     static int logged = 0;
-    if (logged < 20) { logged++; LOGI("ConsumeTokenTicket blocked: count=%d (infinite vouchers)", count); }
+    if (logged < 20) { logged++; LOGI("ConsumeTokenTicket blocked: count=%d", count); }
 }
 
 typedef void (*ConsumeFishCount_t)(void *self, int count, int obtainType, bool save, void *mi);
 static ConsumeFishCount_t g_consumefishcount_orig;
-
 static void consumefishcount_hook(void *self, int count, int obtainType, bool save, void *mi) {
     static int logged = 0;
-    if (logged < 20) { logged++; LOGI("ConsumeFishCount blocked: count=%d (no loss)", count); }
+    if (logged < 20) { logged++; LOGI("ConsumeFishCount blocked: count=%d", count); }
 }
 
 // ---------------------------------------------------------
-// 9. Installer
+// 8. No Dizzy (DamageCarrierHelper.ProcessPlayerDizzy)
+// ---------------------------------------------------------
+typedef float (*ProcessPlayerDizzy_t)(void *controller, float dizzyTime, void *buff, void *mi);
+static ProcessPlayerDizzy_t g_processplayerdizzy_orig;
+
+static float processplayerdizzy_hook(void *controller, float dizzyTime, void *buff, void *mi) {
+    static int logged = 0;
+    if (logged < 20) { logged++; LOGI("ProcessPlayerDizzy blocked: dizzyTime=%.2f", dizzyTime); }
+    return 0.0f;
+}
+
+// ---------------------------------------------------------
+// 9. Season Coin Purchase Always Success
+//    UIComboGunTreasureBoxDialog.CanBuy (argc 3) -> always true
+//    Deduction already covered by ConsumeMaterial hooks.
+// ---------------------------------------------------------
+typedef bool (*CanBuy_t)(void *self, int count, int needTicketCount, int needSeasonCoinCount, void *mi);
+static CanBuy_t g_canbuy_orig;
+
+static bool canbuy_hook(void *self, int count, int needTicketCount, int needSeasonCoinCount, void *mi) {
+    static int logged = 0;
+    if (logged < 20) { logged++; LOGI("CanBuy bypassed: count=%d tickets=%d coins=%d -> true", count, needTicketCount, needSeasonCoinCount); }
+    return true;
+}
+
+// ---------------------------------------------------------
+// 10. Installer
 // ---------------------------------------------------------
 static void install(void *h) {
 #define S(n) xdl_sym(h, n, nullptr)
@@ -289,8 +269,7 @@ static void install(void *h) {
 #undef S
 
     if (!domain_get || !attach || !get_asms || !get_image || !image_name || !class_from_name || !method_by_name) {
-        LOGE("hook: il2cpp api missing");
-        return;
+        LOGE("hook: il2cpp api missing"); return;
     }
     for (int i = 0; i < 180 && is_vm && !is_vm(nullptr); i++) sleep(1);
     void *domain = domain_get();
@@ -327,185 +306,131 @@ static void install(void *h) {
     }
 
 #if defined(__aarch64__)
-    // --- RGBaseController: Dizzy (Stun & Freeze Immunity for Player) ---
-    {
-        void *klass = class_from_name(image, "", "RGBaseController");
-        if (!klass) {
-            LOGE("hook: RGBaseController not found");
-        } else {
-            void *mi_camp = method_by_name(klass, "get_camp", 0);
-            if (mi_camp) {
-                g_getcamp = (GetCamp_t) *(void **) mi_camp;
-                LOGI("hook: RGBaseController.get_camp @%p resolved", (void *)g_getcamp);
-            }
-
-            void *mi_dizzy = method_by_name(klass, "Dizzy", 2);
-            void *addr_dizzy = mi_dizzy ? *(void **) mi_dizzy : nullptr;
-            if (addr_dizzy) {
-                A64HookFunction(addr_dizzy, (void *) dizzy_hook, (void **) &g_dizzy_orig);
-                LOGI("hook: RGBaseController.Dizzy @%p installed", addr_dizzy);
-            } else { LOGE("hook: Dizzy not found"); }
-        }
-    }
-
-    // --- RGControllerTarget: AddBuff (Burn, Shock, Poison Immunity) ---
-    {
-        void *klass = class_from_name(image, "", "RGControllerTarget");
-        if (!klass) {
-            LOGE("hook: RGControllerTarget not found");
-        } else {
-            void *mi_buff = method_by_name(klass, "AddBuff", 1);
-            void *addr_buff = mi_buff ? *(void **) mi_buff : nullptr;
-            if (addr_buff) {
-                A64HookFunction(addr_buff, (void *) player_addrgbuff_hook, (void **) &g_player_addrgbuff_orig);
-                LOGI("hook: RGControllerTarget.AddBuff @%p installed", addr_buff);
-            } else { LOGE("hook: RGControllerTarget.AddBuff not found"); }
-        }
-    }
-
     // --- MallData ---
     {
         void *klass = class_from_name(image, "RGScript.Data.Mall", "MallData");
-        if (!klass) {
-            LOGE("hook: MallData not found");
-        } else {
+        if (!klass) { LOGE("hook: MallData not found"); } else {
             void *mi = method_by_name(klass, "BuyItem", 2);
             void *addr = mi ? *(void **) mi : nullptr;
-            if (addr) {
-                A64HookFunction(addr, (void *) buyitem_hook, (void **) &g_buyitem_orig);
-                LOGI("hook: MallData.BuyItem @%p installed", addr);
-            } else { LOGE("hook: BuyItem not found"); }
+            if (addr) { A64HookFunction(addr, (void *) buyitem_hook, (void **) &g_buyitem_orig); LOGI("hook: MallData.BuyItem @%p installed", addr); }
+            else { LOGE("hook: BuyItem not found"); }
 
             void *mi_he = method_by_name(klass, "HasEnoughCurrency", 1);
             void *addr_he = mi_he ? *(void **) mi_he : nullptr;
-            if (addr_he) {
-                A64HookFunction(addr_he, (void *) hasenough_hook, (void **) &g_hasenough_orig);
-                LOGI("hook: HasEnoughCurrency @%p installed", addr_he);
-            } else { LOGE("hook: HasEnoughCurrency not found"); }
+            if (addr_he) { A64HookFunction(addr_he, (void *) hasenough_hook, (void **) &g_hasenough_orig); LOGI("hook: HasEnoughCurrency @%p installed", addr_he); }
+            else { LOGE("hook: HasEnoughCurrency not found"); }
         }
     }
 
     // --- RGSaveManager ConsumeGem ---
     {
         void *klass = class_from_name(image, "", "RGSaveManager");
-        if (!klass) {
-            LOGE("hook: RGSaveManager not found");
-        } else {
+        if (!klass) { LOGE("hook: RGSaveManager not found"); } else {
             void *mi = method_by_name(klass, "ConsumeGem", 3);
             void *addr = mi ? *(void **) mi : nullptr;
-            if (addr) {
-                A64HookFunction(addr, (void *) consumegem_hook, (void **) &g_consumegem_orig);
-                LOGI("hook: RGSaveManager.ConsumeGem @%p installed", addr);
-            } else { LOGE("hook: ConsumeGem not found"); }
+            if (addr) { A64HookFunction(addr, (void *) consumegem_hook, (void **) &g_consumegem_orig); LOGI("hook: RGSaveManager.ConsumeGem @%p installed", addr); }
+            else { LOGE("hook: ConsumeGem not found"); }
         }
     }
 
     // --- TalentImpl VoidShield + AddDelayDeadBuff ---
     {
         void *klass = class_from_name(image, "TalentImpl", "BuffImplVoidShield");
-        if (!klass) {
-            LOGE("hook: TalentImpl.BuffImplVoidShield not found");
-        } else {
+        if (!klass) { LOGE("hook: TalentImpl.BuffImplVoidShield not found"); } else {
             void *mi = method_by_name(klass, "OnBeforePlayerConsumeVoidShield", 1);
             void *addr = mi ? *(void **) mi : nullptr;
-            if (addr) {
-                A64HookFunction(addr, (void *) consume_hook, (void **) &g_consume_orig);
-                LOGI("hook: VoidShield consume @%p installed", addr);
-            } else { LOGE("hook: OnBeforePlayerConsumeVoidShield not found"); }
+            if (addr) { A64HookFunction(addr, (void *) consume_hook, (void **) &g_consume_orig); LOGI("hook: VoidShield consume @%p installed", addr); }
+            else { LOGE("hook: OnBeforePlayerConsumeVoidShield not found"); }
 
             void *mi2 = method_by_name(klass, "AddDelayDeadBuff", 1);
             void *addr2 = mi2 ? *(void **) mi2 : nullptr;
-            if (addr2) {
-                A64HookFunction(addr2, (void *) adddead_hook, (void **) &g_adddead_orig);
-                LOGI("hook: AddDelayDeadBuff @%p installed", addr2);
-            } else { LOGE("hook: AddDelayDeadBuff not found"); }
+            if (addr2) { A64HookFunction(addr2, (void *) adddead_hook, (void **) &g_adddead_orig); LOGI("hook: AddDelayDeadBuff @%p installed", addr2); }
+            else { LOGE("hook: AddDelayDeadBuff not found"); }
         }
     }
 
     // --- RoleAttributePlayer: SetUpChar + set_energy ---
     {
         void *klass = class_from_name(image, "", "RoleAttributePlayer");
-        if (!klass) {
-            LOGE("hook: RoleAttributePlayer not found");
-        } else {
+        if (!klass) { LOGE("hook: RoleAttributePlayer not found"); } else {
             void *mi0 = method_by_name(klass, "SetUpChar", 0);
             void *addr0 = mi0 ? *(void **) mi0 : nullptr;
-            if (addr0) {
-                A64HookFunction(addr0, (void *) setupchar_hook, (void **) &g_setupchar_orig);
-                LOGI("hook: RoleAttributePlayer.SetUpChar @%p installed", addr0);
-            } else { LOGE("hook: SetUpChar not found in RoleAttributePlayer"); }
+            if (addr0) { A64HookFunction(addr0, (void *) setupchar_hook, (void **) &g_setupchar_orig); LOGI("hook: RoleAttributePlayer.SetUpChar @%p installed", addr0); }
+            else { LOGE("hook: SetUpChar not found in RoleAttributePlayer"); }
 
             void *mi1 = method_by_name(klass, "set_energy", 1);
             void *addr1 = mi1 ? *(void **) mi1 : nullptr;
-            if (addr1) {
-                A64HookFunction(addr1, (void *) setenergy_hook, (void **) &g_setenergy_orig);
-                LOGI("hook: RoleAttributePlayer.set_energy @%p installed", addr1);
-            } else { LOGE("hook: set_energy not found in RoleAttributePlayer"); }
+            if (addr1) { A64HookFunction(addr1, (void *) setenergy_hook, (void **) &g_setenergy_orig); LOGI("hook: RoleAttributePlayer.set_energy @%p installed", addr1); }
+            else { LOGE("hook: set_energy not found in RoleAttributePlayer"); }
         }
     }
 
     // --- SkillInfo: get_FinalCooldown + CalculateFinalCooldown ---
     {
         void *klass = class_from_name(image, "", "SkillInfo");
-        if (!klass) {
-            LOGE("hook: SkillInfo not found");
-        } else {
+        if (!klass) { LOGE("hook: SkillInfo not found"); } else {
             void *mi_final = method_by_name(klass, "get_FinalCooldown", 0);
             void *addr_final = mi_final ? *(void **) mi_final : nullptr;
-            if (addr_final) {
-                A64HookFunction(addr_final, (void *) getfinalcd_hook, (void **) &g_getfinalcd_orig);
-                LOGI("hook: SkillInfo.get_FinalCooldown @%p installed", addr_final);
-            } else { LOGE("hook: get_FinalCooldown not found in SkillInfo"); }
+            if (addr_final) { A64HookFunction(addr_final, (void *) getfinalcd_hook, (void **) &g_getfinalcd_orig); LOGI("hook: SkillInfo.get_FinalCooldown @%p installed", addr_final); }
+            else { LOGE("hook: get_FinalCooldown not found in SkillInfo"); }
 
             void *mi_calc = method_by_name(klass, "CalculateFinalCooldown", 1);
             void *addr_calc = mi_calc ? *(void **) mi_calc : nullptr;
-            if (addr_calc) {
-                A64HookFunction(addr_calc, (void *) calcfinalcd_hook, (void **) &g_calcfinalcd_orig);
-                LOGI("hook: SkillInfo.CalculateFinalCooldown @%p installed", addr_calc);
-            } else { LOGE("hook: CalculateFinalCooldown not found in SkillInfo"); }
+            if (addr_calc) { A64HookFunction(addr_calc, (void *) calcfinalcd_hook, (void **) &g_calcfinalcd_orig); LOGI("hook: SkillInfo.CalculateFinalCooldown @%p installed", addr_calc); }
+            else { LOGE("hook: CalculateFinalCooldown not found in SkillInfo"); }
         }
     }
 
     // --- ItemData: Materials, Seeds, Vouchers, Fish Chips (All No-Op) ---
     {
         void *klass = class_from_name(image, "", "ItemData");
-        if (!klass) {
-            LOGE("hook: ItemData not found");
-        } else {
+        if (!klass) { LOGE("hook: ItemData not found"); } else {
             void *mi3 = method_by_name(klass, "ConsumeMaterial", 3);
             void *addr3 = mi3 ? *(void **) mi3 : nullptr;
-            if (addr3) {
-                A64HookFunction(addr3, (void *) consumemat3_hook, (void **) &g_consumemat3_orig);
-                LOGI("hook: ItemData.ConsumeMaterial(3) @%p installed", addr3);
-            } else { LOGE("hook: ConsumeMaterial(3) not found in ItemData"); }
+            if (addr3) { A64HookFunction(addr3, (void *) consumemat3_hook, (void **) &g_consumemat3_orig); LOGI("hook: ItemData.ConsumeMaterial(3) @%p installed", addr3); }
+            else { LOGE("hook: ConsumeMaterial(3) not found in ItemData"); }
 
             void *mi6 = method_by_name(klass, "ConsumeMaterial", 6);
             void *addr6 = mi6 ? *(void **) mi6 : nullptr;
-            if (addr6) {
-                A64HookFunction(addr6, (void *) consumemat6_hook, (void **) &g_consumemat6_orig);
-                LOGI("hook: ItemData.ConsumeMaterial(6) @%p installed", addr6);
-            } else { LOGE("hook: ConsumeMaterial(6) not found in ItemData"); }
+            if (addr6) { A64HookFunction(addr6, (void *) consumemat6_hook, (void **) &g_consumemat6_orig); LOGI("hook: ItemData.ConsumeMaterial(6) @%p installed", addr6); }
+            else { LOGE("hook: ConsumeMaterial(6) not found in ItemData"); }
 
             void *mi_seed = method_by_name(klass, "ConsumeSeed", 1);
             void *addr_seed = mi_seed ? *(void **) mi_seed : nullptr;
-            if (addr_seed) {
-                A64HookFunction(addr_seed, (void *) consumeseed_hook, (void **) &g_consumeseed_orig);
-                LOGI("hook: ItemData.ConsumeSeed @%p installed", addr_seed);
-            } else { LOGE("hook: ConsumeSeed not found in ItemData"); }
+            if (addr_seed) { A64HookFunction(addr_seed, (void *) consumeseed_hook, (void **) &g_consumeseed_orig); LOGI("hook: ItemData.ConsumeSeed @%p installed", addr_seed); }
+            else { LOGE("hook: ConsumeSeed not found in ItemData"); }
 
             void *mi_ticket = method_by_name(klass, "ConsumeTokenTicket", 2);
             void *addr_ticket = mi_ticket ? *(void **) mi_ticket : nullptr;
-            if (addr_ticket) {
-                A64HookFunction(addr_ticket, (void *) consumeticket_hook, (void **) &g_consumeticket_orig);
-                LOGI("hook: ItemData.ConsumeTokenTicket @%p installed", addr_ticket);
-            } else { LOGE("hook: ConsumeTokenTicket not found in ItemData"); }
+            if (addr_ticket) { A64HookFunction(addr_ticket, (void *) consumeticket_hook, (void **) &g_consumeticket_orig); LOGI("hook: ItemData.ConsumeTokenTicket @%p installed", addr_ticket); }
+            else { LOGE("hook: ConsumeTokenTicket not found in ItemData"); }
 
             void *mi_fish = method_by_name(klass, "ConsumeFishCount", 3);
             void *addr_fish = mi_fish ? *(void **) mi_fish : nullptr;
-            if (addr_fish) {
-                A64HookFunction(addr_fish, (void *) consumefishcount_hook, (void **) &g_consumefishcount_orig);
-                LOGI("hook: ItemData.ConsumeFishCount @%p installed", addr_fish);
-            } else { LOGE("hook: ConsumeFishCount not found in ItemData"); }
+            if (addr_fish) { A64HookFunction(addr_fish, (void *) consumefishcount_hook, (void **) &g_consumefishcount_orig); LOGI("hook: ItemData.ConsumeFishCount @%p installed", addr_fish); }
+            else { LOGE("hook: ConsumeFishCount not found in ItemData"); }
+        }
+    }
+
+    // --- DamageCarrierHelper: No Dizzy ---
+    {
+        void *klass = class_from_name(image, "", "DamageCarrierHelper");
+        if (!klass) { LOGE("hook: DamageCarrierHelper not found"); } else {
+            void *mi = method_by_name(klass, "ProcessPlayerDizzy", 3);
+            void *addr = mi ? *(void **) mi : nullptr;
+            if (addr) { A64HookFunction(addr, (void *) processplayerdizzy_hook, (void **) &g_processplayerdizzy_orig); LOGI("hook: DamageCarrierHelper.ProcessPlayerDizzy @%p installed", addr); }
+            else { LOGE("hook: ProcessPlayerDizzy not found in DamageCarrierHelper"); }
+        }
+    }
+
+    // --- Season Coin: CanBuy Always True ---
+    {
+        void *klass = class_from_name(image, "ModeSeason.ComboGun.UI.Windows", "UIComboGunTreasureBoxDialog");
+        if (!klass) { LOGE("hook: UIComboGunTreasureBoxDialog not found"); } else {
+            void *mi = method_by_name(klass, "CanBuy", 3);
+            void *addr = mi ? *(void **) mi : nullptr;
+            if (addr) { A64HookFunction(addr, (void *) canbuy_hook, (void **) &g_canbuy_orig); LOGI("hook: UIComboGunTreasureBoxDialog.CanBuy @%p installed", addr); }
+            else { LOGE("hook: CanBuy not found in UIComboGunTreasureBoxDialog"); }
         }
     }
 #endif
