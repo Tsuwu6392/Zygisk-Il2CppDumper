@@ -240,21 +240,44 @@ static float processplayerdizzy_hook(void *controller, float dizzyTime, void *bu
 }
 
 // ---------------------------------------------------------
-// 9. Season Coin Purchase Always Success
-//    UIComboGunTreasureBoxDialog.CanBuy (argc 3) -> always true
-//    Deduction already covered by ConsumeMaterial hooks.
+// 9. Season Coin: No Deduct + Always Affordable
+//    WindowBuyOrWatchAdDialog (RGScript.UI)
 // ---------------------------------------------------------
-typedef bool (*CanBuy_t)(void *self, int count, int needTicketCount, int needSeasonCoinCount, void *mi);
-static CanBuy_t g_canbuy_orig;
-
-static bool canbuy_hook(void *self, int count, int needTicketCount, int needSeasonCoinCount, void *mi) {
+typedef void (*DoConsumeSeasonCoin_t)(void *self, void *mi);
+static DoConsumeSeasonCoin_t g_doconsumeseasoncoin_orig;
+static void doconsumeseasoncoin_hook(void *self, void *mi) {
     static int logged = 0;
-    if (logged < 20) { logged++; LOGI("CanBuy bypassed: count=%d tickets=%d coins=%d -> true", count, needTicketCount, needSeasonCoinCount); }
+    if (logged < 20) { logged++; LOGI("DoConsumeSeasonCoin blocked: balance preserved"); }
+}
+
+typedef void (*DoConsumeGem2_t)(void *self, void *mi);
+static DoConsumeGem2_t g_doconsumegem2_orig;
+static void doconsumegem2_hook(void *self, void *mi) {
+    static int logged = 0;
+    if (logged < 20) { logged++; LOGI("DoConsumeGem (dialog) blocked"); }
+}
+
+typedef bool (*IsAffordable_t)(void *self, void *mi);
+static IsAffordable_t g_isaffordable_orig;
+static bool isaffordable_hook(void *self, void *mi) {
+    static int logged = 0;
+    if (logged < 20) { logged++; LOGI("IsAffordable bypassed -> true"); }
     return true;
 }
 
 // ---------------------------------------------------------
-// 10. Installer
+// 10. get_AutoAttack Always True (RGWeapon)
+//     Global fully automatic for all weapons, no gadget needed.
+// ---------------------------------------------------------
+typedef bool (*GetAutoAttack_t)(void *self, void *mi);
+static GetAutoAttack_t g_getautoattack_orig;
+static bool getautoattack_hook(void *self, void *mi) {
+    return true;
+}
+
+
+// ---------------------------------------------------------
+// 11. Installer
 // ---------------------------------------------------------
 static void install(void *h) {
 #define S(n) xdl_sym(h, n, nullptr)
@@ -423,16 +446,38 @@ static void install(void *h) {
         }
     }
 
-    // --- Season Coin: CanBuy Always True ---
+    // --- WindowBuyOrWatchAdDialog: Season Coin No Deduct + Always Affordable ---
     {
-        void *klass = class_from_name(image, "ModeSeason.ComboGun.UI.Windows", "UIComboGunTreasureBoxDialog");
-        if (!klass) { LOGE("hook: UIComboGunTreasureBoxDialog not found"); } else {
-            void *mi = method_by_name(klass, "CanBuy", 3);
-            void *addr = mi ? *(void **) mi : nullptr;
-            if (addr) { A64HookFunction(addr, (void *) canbuy_hook, (void **) &g_canbuy_orig); LOGI("hook: UIComboGunTreasureBoxDialog.CanBuy @%p installed", addr); }
-            else { LOGE("hook: CanBuy not found in UIComboGunTreasureBoxDialog"); }
+        void *klass = class_from_name(image, "RGScript.UI", "WindowBuyOrWatchAdDialog");
+        if (!klass) { LOGE("hook: WindowBuyOrWatchAdDialog not found"); } else {
+            void *mi_sc = method_by_name(klass, "DoConsumeSeasonCoin", 0);
+            void *addr_sc = mi_sc ? *(void **) mi_sc : nullptr;
+            if (addr_sc) { A64HookFunction(addr_sc, (void *) doconsumeseasoncoin_hook, (void **) &g_doconsumeseasoncoin_orig); LOGI("hook: DoConsumeSeasonCoin @%p installed", addr_sc); }
+            else { LOGE("hook: DoConsumeSeasonCoin not found"); }
+
+            void *mi_gem = method_by_name(klass, "DoConsumeGem", 0);
+            void *addr_gem = mi_gem ? *(void **) mi_gem : nullptr;
+            if (addr_gem) { A64HookFunction(addr_gem, (void *) doconsumegem2_hook, (void **) &g_doconsumegem2_orig); LOGI("hook: DoConsumeGem (dialog) @%p installed", addr_gem); }
+            else { LOGE("hook: DoConsumeGem (dialog) not found"); }
+
+            void *mi_af = method_by_name(klass, "IsAffordable", 0);
+            void *addr_af = mi_af ? *(void **) mi_af : nullptr;
+            if (addr_af) { A64HookFunction(addr_af, (void *) isaffordable_hook, (void **) &g_isaffordable_orig); LOGI("hook: IsAffordable @%p installed", addr_af); }
+            else { LOGE("hook: IsAffordable not found"); }
         }
     }
+
+    // --- RGWeapon: get_AutoAttack Always True ---
+    {
+        void *klass = class_from_name(image, "", "RGWeapon");
+        if (!klass) { LOGE("hook: RGWeapon not found"); } else {
+            void *mi = method_by_name(klass, "get_AutoAttack", 0);
+            void *addr = mi ? *(void **) mi : nullptr;
+            if (addr) { A64HookFunction(addr, (void *) getautoattack_hook, (void **) &g_getautoattack_orig); LOGI("hook: RGWeapon.get_AutoAttack @%p installed", addr); }
+            else { LOGE("hook: get_AutoAttack not found in RGWeapon"); }
+        }
+    }
+
 #endif
 }
 
