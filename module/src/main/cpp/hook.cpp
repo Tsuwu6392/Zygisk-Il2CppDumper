@@ -273,9 +273,15 @@ static bool isaffordable_hook(void *self, void *mi) {
 // 10. get_AutoAttack Always True (RGWeapon)
 //     Global fully automatic for all weapons, no gadget needed.
 // ---------------------------------------------------------
+//     Three getters are hooked so the log shows which one the game really uses:
+//     [0] get_AutoAttack (public)  [1] get__autoAttack (protected, used by subclasses)
 typedef bool (*GetAutoAttack_t)(void *self, void *mi);
-static GetAutoAttack_t g_getautoattack_orig;
-static bool getautoattack_hook(void *self, void *mi) {
+static GetAutoAttack_t g_autoattack_orig[2];
+
+template <int N>
+static bool autoattack_hook(void *self, void *mi) {
+    static int logged = 0;
+    if (logged < 10) { logged++; LOGI("RGWeapon auto-attack getter[%d] -> true", N); }
     return true;
 }
 
@@ -423,9 +429,12 @@ static void install(void *h) {
     }
 
     // --- autoattack: all weapons fully automatic ---
-    if (on("autoattack"))
+    if (on("autoattack")) {
         hook(image, "", "RGWeapon", "get_AutoAttack", 0,
-             (void *) getautoattack_hook, (void **) &g_getautoattack_orig);
+             (void *) autoattack_hook<0>, (void **) &g_autoattack_orig[0]);
+        hook(image, "", "RGWeapon", "get__autoAttack", 0,
+             (void *) autoattack_hook<1>, (void **) &g_autoattack_orig[1]);
+    }
 }
 
 void hook_start(void *handle) { std::thread(install, handle).detach(); }
