@@ -25,9 +25,10 @@ extern "C" void A64HookFunction(void *symbol, void *replace, void **result);
 #define CFG_DIR "/storage/emulated/0/Android/data/com.ChillyRoom.DungeonShooter/files/"
 
 // ---------------------------------------------------------
-// File log: everything LOGI/LOGE prints is also appended to
-// CFG_DIR/ds_log.txt (truncated on every game start), so it can be read
-// from Termux without logcat:  cat <CFG_DIR>ds_log.txt
+// File log: everything LOGI/LOGE prints is also appended to two files
+// (truncated on every game start): CFG_DIR/ds_log.txt and the game's
+// internal data dir /data/data/<pkg>/ds_log.txt. Read from Termux with:
+//   su -c 'cat /data/data/com.ChillyRoom.DungeonShooter/ds_log.txt'
 // ---------------------------------------------------------
 #include <cstdarg>
 #if __has_include(<android/log.h>)
@@ -35,22 +36,30 @@ extern "C" void A64HookFunction(void *symbol, void *replace, void **result);
 #define DS_HAVE_ALOG 1
 #endif
 
+#define LOG_PATH_EXT CFG_DIR "ds_log.txt"
+#define LOG_PATH_INT "/data/data/com.ChillyRoom.DungeonShooter/ds_log.txt"
+
+static void ds_log_file(const char *path, int err, const char *fmt, va_list ap) {
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    fputs(err ? "E " : "I ", f);
+    vfprintf(f, fmt, ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
 static void ds_log(int err, const char *fmt, ...) {
     va_list ap;
-    va_start(ap, fmt);
 #ifdef DS_HAVE_ALOG
-    va_list ap2;
-    va_copy(ap2, ap);
-    __android_log_vprint(err ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO, "DSHook", fmt, ap2);
-    va_end(ap2);
+    va_start(ap, fmt);
+    __android_log_vprint(err ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO, "DSHook", fmt, ap);
+    va_end(ap);
 #endif
-    FILE *f = fopen(CFG_DIR "ds_log.txt", "a");
-    if (f) {
-        fputs(err ? "E " : "I ", f);
-        vfprintf(f, fmt, ap);
-        fputc('\n', f);
-        fclose(f);
-    }
+    va_start(ap, fmt);
+    ds_log_file(LOG_PATH_EXT, err, fmt, ap);
+    va_end(ap);
+    va_start(ap, fmt);
+    ds_log_file(LOG_PATH_INT, err, fmt, ap);
     va_end(ap);
 }
 #undef LOGI
@@ -498,7 +507,6 @@ static void install(void *h) {
     if (!domain_get || !attach || !get_asms || !get_image || !image_name || !class_from_name || !method_by_name) {
         LOGE("hook: il2cpp api missing"); return;
     }
-    { FILE *lf = fopen(CFG_DIR "ds_log.txt", "w"); if (lf) fclose(lf); }
     LOGI("install: start");
     load_cfg();
 
@@ -650,4 +658,10 @@ static void install(void *h) {
     }
 }
 
-void hook_start(void *handle) { std::thread(install, handle).detach(); }
+void hook_start(void *handle) {
+    // fresh log files on every game start, then note that we got here at all
+    { FILE *f = fopen(LOG_PATH_EXT, "w"); if (f) fclose(f); }
+    { FILE *f = fopen(LOG_PATH_INT, "w"); if (f) fclose(f); }
+    LOGI("hook_start: module entered, pid=%d", (int) getpid());
+    std::thread(install, handle).detach();
+}
