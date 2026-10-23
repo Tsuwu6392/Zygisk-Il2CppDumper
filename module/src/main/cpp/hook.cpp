@@ -270,19 +270,36 @@ static bool isaffordable_hook(void *self, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 10. get_AutoAttack Always True (RGWeapon)
-//     Global fully automatic for all weapons, no gadget needed.
+// 10. get_AutoAttack: true while in battle (RGWeapon)
+//     Outside battle, returns the game's own value so a real
+//     Fully Automatic Device still works.
+//     [0] get_AutoAttack (public)  [1] get__autoAttack (protected)
 // ---------------------------------------------------------
-//     Three getters are hooked so the log shows which one the game really uses:
-//     [0] get_AutoAttack (public)  [1] get__autoAttack (protected, used by subclasses)
 typedef bool (*GetAutoAttack_t)(void *self, void *mi);
 static GetAutoAttack_t g_autoattack_orig[2];
+
+typedef bool (*InBattle_t)(void *mi);
+static InBattle_t g_inbattle = nullptr;
+static void *g_inbattle_mi = nullptr;
 
 template <int N>
 static bool autoattack_hook(void *self, void *mi) {
     static int logged = 0;
-    if (logged < 10) { logged++; LOGI("RGWeapon auto-attack getter[%d] -> true", N); }
-    return true;
+    bool orig = g_autoattack_orig[N] ? g_autoattack_orig[N](self, mi) : false;
+    bool r = g_inbattle ? (orig || g_inbattle(g_inbattle_mi)) : true;
+    if (logged < 10) { logged++; LOGI("autoattack[%d] orig=%d -> %d", N, orig, r); }
+    return r;
+}
+
+typedef bool (*HasTags_t)(void *self, void *mi);
+static HasTags_t g_hastags_orig;
+
+static bool hastags_hook(void *self, void *mi) {
+    static int logged = 0;
+    bool orig = g_hastags_orig ? g_hastags_orig(self, mi) : false;
+    bool r = orig || (g_inbattle && g_inbattle(g_inbattle_mi));
+    if (logged < 10) { logged++; LOGI("HasAutoAttackTags orig=%d -> %d", orig, r); }
+    return r;
 }
 
 // ---------------------------------------------------------
@@ -342,6 +359,15 @@ static void install(void *h) {
         if (!image) sleep(1);
     }
     if (!image) { LOGE("hook: Assembly-CSharp not found"); return; }
+    {
+        void *gu = class_from_name(image, "", "GameUtil");
+        void *imi = gu ? method_by_name(gu, "InBattleState", 0) : nullptr;
+        if (imi && *(void **) imi) {
+            g_inbattle_mi = imi;
+            g_inbattle = (InBattle_t) *(void **) imi;
+            LOGI("InBattleState resolved @%p", (void *) g_inbattle);
+        } else LOGE("InBattleState not found, autoattack falls back to always-true");
+    }
 
     // --- hp: HurtHp (base + subclass overrides, deduped by address) ---
     if (on("hp")) {
@@ -434,6 +460,8 @@ static void install(void *h) {
              (void *) autoattack_hook<0>, (void **) &g_autoattack_orig[0]);
         hook(image, "", "RGWeapon", "get__autoAttack", 0,
              (void *) autoattack_hook<1>, (void **) &g_autoattack_orig[1]);
+        hook(image, "", "RGWeapon", "get_HasAutoAttackTags", 0,
+             (void *) hastags_hook, (void **) &g_hastags_orig);
     }
 }
 
