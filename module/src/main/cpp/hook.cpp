@@ -22,7 +22,7 @@ extern "C" void A64HookFunction(void *symbol, void *replace, void **result);
 //                  Missing file or unlisted name = enabled.
 //   sk_cd.txt    : cooldown factor 0.0 - 1.0 (re-read every second).
 //   Names: hp shield delaydead mall gem energy cooldown items dizzy
-//          seasoncoin autoattack crit shop goldarmor
+//          seasoncoin autoattack crit shop goldarmor lockedlevel saleday
 // ---------------------------------------------------------
 #define CFG_DIR "/storage/emulated/0/Android/data/com.ChillyRoom.DungeonShooter/files/"
 
@@ -102,6 +102,21 @@ static float get_cd_factor() {
 }
 
 // ---------------------------------------------------------
+// Field offsets. Each default is the value from the current dump; the
+// installer overwrites it with the offset looked up BY NAME at runtime
+// (il2cpp_class_get_field_from_name + il2cpp_field_get_offset), so a game
+// update that shifts a field cannot silently corrupt memory. If the lookup
+// fails, the default is kept and an E line is logged.
+// ---------------------------------------------------------
+static int g_off_itemprice  = 0x24;   // MallItem.itemPrice
+static int g_off_finalprice = 0x28;   // MallItem.finalPrice
+static int g_off_maxenergy  = 0x178;  // RoleAttributePlayer.max_energy
+static int g_off_energy     = 0x17c;  // RoleAttributePlayer._energy
+static int g_off_critical   = 0x40;   // DamageTrigger.critical
+static int g_off_camp       = 0x64;   // DamageTrigger.camp
+static int g_off_curcoin    = 0x10;   // CoinChangeEvent.curCoinVal
+
+// ---------------------------------------------------------
 // 1. HurtHp Hooks (God Mode)
 // ---------------------------------------------------------
 typedef void (*HurtHp_t)(void *self, int damage, void *src, void *mi);
@@ -169,8 +184,8 @@ static R16 buyitem_hook(void *self, void *mallItem, void *onDone, void *mi) {
     static int logged = 0;
     if (logged < 20) { logged++; LOGI("BuyItem hit! Forcing price to 0."); }
     if (mallItem) {
-        *(int *)((char *)mallItem + 0x24) = 0;
-        *(int *)((char *)mallItem + 0x28) = 0;
+        *(int *)((char *)mallItem + g_off_itemprice) = 0;
+        *(int *)((char *)mallItem + g_off_finalprice) = 0;
     }
     return g_buyitem_orig(self, mallItem, onDone, mi);
 }
@@ -213,8 +228,8 @@ static void setenergy_hook(void *self, int value, void *mi) {
     g_setenergy_orig(self, value, mi);
     if (!self) return;
 
-    int *p_max = (int *)((char *)self + 0x178);
-    int *p_cur = (int *)((char *)self + 0x17c);
+    int *p_max = (int *)((char *)self + g_off_maxenergy);
+    int *p_cur = (int *)((char *)self + g_off_energy);
     int max = *p_max;
     int cur = *p_cur;
     if (max > 0 && cur <= ENERGY_REFILL) {
@@ -371,8 +386,9 @@ static void m12setattack_hook(void *self, bool v, bool hand, void *mi) {
 
 // ---------------------------------------------------------
 // 11. Always Crit (not tied to the Precise Strike buff)
-//     DamageTrigger.HandleCritical is the roll. Trigger fields:
-//     critical @0x40, camp @0x64. Camp.Character == 1.
+//     DamageTrigger.HandleCritical is the roll. Trigger fields
+//     critical and camp are resolved by name (g_off_critical / g_off_camp).
+//     Camp.Character == 1.
 //     DealDamage is a fallback: forces isCrit for player-camp damage.
 // ---------------------------------------------------------
 static const int CAMP_CHARACTER = 1;
@@ -383,9 +399,9 @@ static HandleCritical_t g_handlecrit_orig;
 static void handlecrit_hook(void *self, void *mi) {
     static int logged = 0;
     if (self) {
-        int camp = *(int *)((char *)self + 0x64);
+        int camp = *(int *)((char *)self + g_off_camp);
         if (camp == CAMP_CHARACTER) {
-            int *p_crit = (int *)((char *)self + 0x40);
+            int *p_crit = (int *)((char *)self + g_off_critical);
             if (logged < 20) { logged++; LOGI("HandleCritical: camp=%d critical %d -> 10000", camp, *p_crit); }
             *p_crit = 10000;
         }
@@ -509,7 +525,7 @@ static bool hasbuff_hook(void *self, int buff, void *mi) {
 // ---------------------------------------------------------
 // 13. Golden Armor+ (not tied to the buff)
 //     Every GOLD_STEP coins owned = +1 max HP and +1 max armor, no cap.
-//     Coin count is captured from CoinChangeEvent.curCoinVal (@0x10) in
+//     Coin count is captured from CoinChangeEvent.curCoinVal (g_off_curcoin) in
 //     RoleAttributePlayer.OnCoinChange and from UpdateArmor(coinVal).
 //     The bonus is added in RoleAttributeProxy.get_max_hp / get_MaxArmor
 //     (the single source for 330 / 37 callers). Both must return Int32;
@@ -526,7 +542,7 @@ static OnCoinChange_t g_oncoin_orig;
 static void oncoin_hook(void *self, void *ev, void *mi) {
     static int logged = 0;
     if (ev) {
-        int cur = *(int *)((char *)ev + 0x10);
+        int cur = *(int *)((char *)ev + g_off_curcoin);
         if (cur >= 0) g_coin = cur;
         if (logged < 20) { logged++; LOGI("OnCoinChange: curCoinVal=%d (+%d)", cur, gold_bonus()); }
     }
@@ -565,7 +581,93 @@ static int getmaxarmor_hook(void *self, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 14. Installer
+// 14. Level up locked heroes (e.g. trial-ticket heroes)
+//     RGSaveManager.HeroLevelUp / ChooseHeroModel.OnUpgradeButtonClicked have
+//     no unlock check (verified in the disassembly). The only gate is the UI:
+//     ChooseHeroView.RefreshUnlockArea shows _upgradeButton only when
+//     data.unlocked && data.level < data.maxLevel. After the original ran, if
+//     the hero is locked and below max level, the button is switched on.
+//     ChooseHeroData is a struct passed by pointer; its field offsets are
+//     resolved by name (il2cpp reports them with the 0x10 object header,
+//     the pointer we get points at the raw struct, so 0x10 is subtracted).
+// ---------------------------------------------------------
+static int g_off_cd_unlocked = 0x4;     // ChooseHeroData.unlocked (bool)
+static int g_off_cd_level    = 0xc;     // ChooseHeroData.level
+static int g_off_cd_maxlevel = 0x10;    // ChooseHeroData.maxLevel
+static int g_off_cv_upgrade  = 0x1f0;   // ChooseHeroView._upgradeButton (Transform)
+
+typedef void *(*GetGO_t)(void *self, void *mi);
+typedef void (*SetActive_t)(void *self, bool on, void *mi);
+static GetGO_t g_getgo = nullptr;
+static void *g_getgo_mi = nullptr;
+static SetActive_t g_setactive = nullptr;
+static void *g_setactive_mi = nullptr;
+
+typedef void (*RefreshUnlockArea_t)(void *self, void *data, void *mi);
+static RefreshUnlockArea_t g_refreshunlock_orig;
+
+static void refreshunlockarea_hook(void *self, void *data, void *mi) {
+    static int logged = 0;
+    g_refreshunlock_orig(self, data, mi);
+    if (!self || !data || !g_getgo || !g_setactive) return;
+    bool unlocked = *(volatile uint8_t *)((char *)data + g_off_cd_unlocked) != 0;
+    int lv = *(int *)((char *)data + g_off_cd_level);
+    int mx = *(int *)((char *)data + g_off_cd_maxlevel);
+    if (unlocked || mx <= 0 || lv >= mx) return;
+    void *btn = *(void **)((char *)self + g_off_cv_upgrade);
+    if (!btn) return;
+    void *go = g_getgo(btn, g_getgo_mi);
+    if (!go) return;
+    g_setactive(go, true, g_setactive_mi);
+    if (logged < 20) { logged++; LOGI("lockedlevel: upgrade button shown for locked hero (level %d/%d)", lv, mx); }
+}
+
+// ---------------------------------------------------------
+// 15. Sales Day challenge always active
+//     Sales Day is emBattleFactor 316. BattleData.get_IsSaleDay is
+//         if (get_IsNormalMode()) return CompareFactor(316); else false
+//     and its callers (map structure generation, chest/special room
+//     instantiation, GetSpecialRoomCount, the Lua wrapper) all go through
+//     it. CompareFactor(factor) is the single per-factor check, so it is
+//     hooked: for factor 316 it returns true whenever IsNormalMode is true
+//     (the same gate the game uses). Every other factor (Bad Luck = 103
+//     and the rest) gets the real answer, so no other challenge changes.
+//     Each distinct return address that asks for 316 is logged once, which
+//     shows who reads the factor.
+// ---------------------------------------------------------
+static const int FACTOR_SALEDAY = 316;
+
+typedef bool (*CompareFactor_t)(void *self, int factor, void *mi);
+static CompareFactor_t g_comparefactor_orig;
+
+typedef bool (*IsNormalMode_t)(void *self, void *mi);
+static IsNormalMode_t g_isnormal = nullptr;
+static void *g_isnormal_mi = nullptr;
+
+static thread_local bool g_cf_busy = false;
+static uintptr_t g_cf_seen[24];
+static int g_cf_nseen = 0;
+
+__attribute__((noinline))
+static bool comparefactor_hook(void *self, int factor, void *mi) {
+    bool r = g_comparefactor_orig(self, factor, mi);
+    if (factor != FACTOR_SALEDAY || r || !self || g_cf_busy) return r;
+    g_cf_busy = true;
+    bool normal = g_isnormal ? g_isnormal(self, g_isnormal_mi) : true;
+    g_cf_busy = false;
+    if (!normal) return r;
+    uintptr_t ra = (uintptr_t) __builtin_return_address(0);
+    bool seen = false;
+    for (int i = 0; i < g_cf_nseen; i++) if (g_cf_seen[i] == ra) { seen = true; break; }
+    if (!seen && g_cf_nseen < 24) {
+        g_cf_seen[g_cf_nseen++] = ra;
+        LOGI("saleday: CompareFactor(316) false -> true (ra=%p, site #%d)", (void *) ra, g_cf_nseen);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------
+// 16. Installer
 // ---------------------------------------------------------
 typedef void *(*ClassFromName_t)(void *, const char *, const char *);
 typedef void *(*MethodByName_t)(void *, const char *, int);
@@ -641,6 +743,21 @@ static int (*field_get_offset)(void *) = nullptr;
 static void *(*method_ret_type)(void *) = nullptr;
 static int (*type_get_type)(void *) = nullptr;
 static const int IL2CPP_TYPE_I4 = 0x08;
+
+// Look up an instance field offset by class + field name. Keeps `fallback`
+// (and logs an E line) if the class or field cannot be found.
+static int resolve_off(void *img, const char *cls, const char *fld, int fallback) {
+    void *k = find_class(img, cls);
+    void *f = (k && class_get_field && field_get_offset) ? class_get_field(k, fld) : nullptr;
+    int off = f ? field_get_offset(f) : -1;
+    if (off > 0 && off < 0x1000) {
+        if (off == fallback) LOGI("field: %s.%s offset 0x%x (by name)", cls, fld, off);
+        else LOGI("field: %s.%s offset 0x%x (by name, CHANGED from old 0x%x)", cls, fld, off, fallback);
+        return off;
+    }
+    LOGE("field: %s.%s not found, keeping fallback 0x%x", cls, fld, fallback);
+    return fallback;
+}
 
 static bool hook(void *img, const char *ns, const char *cls, const char *m, int argc,
                  void *repl, void **orig, int ret_type = -1) {
@@ -718,6 +835,49 @@ static void install(void *h) {
             g_inbattle = (InBattle_t) *(void **) imi;
             LOGI("InBattleState resolved @%p", (void *) g_inbattle);
         } else LOGE("InBattleState not found, autoattack falls back to always-true");
+    }
+
+    // --- field offsets, resolved by name before any hook that reads them ---
+    if (on("mall")) {
+        g_off_itemprice  = resolve_off(image, "MallItem", "itemPrice", g_off_itemprice);
+        g_off_finalprice = resolve_off(image, "MallItem", "finalPrice", g_off_finalprice);
+    }
+    if (on("energy")) {
+        g_off_maxenergy = resolve_off(image, "RoleAttributePlayer", "max_energy", g_off_maxenergy);
+        g_off_energy    = resolve_off(image, "RoleAttributePlayer", "_energy", g_off_energy);
+    }
+    if (on("crit")) {
+        g_off_critical = resolve_off(image, "DamageTrigger", "critical", g_off_critical);
+        g_off_camp     = resolve_off(image, "DamageTrigger", "camp", g_off_camp);
+    }
+    if (on("goldarmor"))
+        g_off_curcoin = resolve_off(image, "CoinChangeEvent", "curCoinVal", g_off_curcoin);
+
+    // --- lockedlevel: show the upgrade button for locked heroes ---
+    if (on("lockedlevel")) {
+        int o;
+        o = resolve_off(image, "ChooseHeroData", "unlocked", g_off_cd_unlocked + 0x10);
+        g_off_cd_unlocked = o >= 0x10 ? o - 0x10 : o;
+        o = resolve_off(image, "ChooseHeroData", "level", g_off_cd_level + 0x10);
+        g_off_cd_level = o >= 0x10 ? o - 0x10 : o;
+        o = resolve_off(image, "ChooseHeroData", "maxLevel", g_off_cd_maxlevel + 0x10);
+        g_off_cd_maxlevel = o >= 0x10 ? o - 0x10 : o;
+        g_off_cv_upgrade = resolve_off(image, "ChooseHeroView", "_upgradeButton", g_off_cv_upgrade);
+        LOGI("lockedlevel: data offsets unlocked=0x%x level=0x%x maxLevel=0x%x", g_off_cd_unlocked, g_off_cd_level, g_off_cd_maxlevel);
+
+        void *tk = find_class(image, "Transform");
+        void *gk = find_class(image, "GameObject");
+        void *gmi = tk ? method_by_name(tk, "get_gameObject", 0) : nullptr;
+        void *smi = gk ? method_by_name(gk, "SetActive", 1) : nullptr;
+        if (gmi && *(void **) gmi && smi && *(void **) smi) {
+            g_getgo = (GetGO_t) *(void **) gmi;
+            g_getgo_mi = gmi;
+            g_setactive = (SetActive_t) *(void **) smi;
+            g_setactive_mi = smi;
+            LOGI("lockedlevel: get_gameObject @%p SetActive @%p", (void *) g_getgo, (void *) g_setactive);
+            hook(image, "", "ChooseHeroView", "RefreshUnlockArea", 1,
+                 (void *) refreshunlockarea_hook, (void **) &g_refreshunlock_orig);
+        } else LOGE("lockedlevel: Transform.get_gameObject / GameObject.SetActive not found, skipped");
     }
 
     // --- hp: HurtHp (base + subclass overrides, deduped by address) ---
@@ -880,6 +1040,19 @@ static void install(void *h) {
              (void *) getmaxhp_hook, (void **) &g_getmaxhp_orig, IL2CPP_TYPE_I4);
         hook(image, "", "RoleAttributeProxy", "get_MaxArmor", 0,
              (void *) getmaxarmor_hook, (void **) &g_getmaxarmor_orig, IL2CPP_TYPE_I4);
+    }
+
+    // --- saleday: Sales Day challenge (factor 316) always active ---
+    if (on("saleday")) {
+        void *bk = find_class(image, "BattleData");
+        void *nmi = bk ? method_by_name(bk, "get_IsNormalMode", 0) : nullptr;
+        if (nmi && *(void **) nmi) {
+            g_isnormal = (IsNormalMode_t) *(void **) nmi;
+            g_isnormal_mi = nmi;
+            LOGI("saleday: get_IsNormalMode resolved @%p", (void *) g_isnormal);
+        } else LOGE("saleday: BattleData.get_IsNormalMode not found, gate skipped");
+        hook(image, "", "BattleData", "CompareFactor", 1,
+             (void *) comparefactor_hook, (void **) &g_comparefactor_orig);
     }
 }
 
