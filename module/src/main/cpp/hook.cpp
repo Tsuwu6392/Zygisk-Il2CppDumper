@@ -24,6 +24,40 @@ extern "C" void A64HookFunction(void *symbol, void *replace, void **result);
 // ---------------------------------------------------------
 #define CFG_DIR "/storage/emulated/0/Android/data/com.ChillyRoom.DungeonShooter/files/"
 
+// ---------------------------------------------------------
+// File log: everything LOGI/LOGE prints is also appended to
+// CFG_DIR/ds_log.txt (truncated on every game start), so it can be read
+// from Termux without logcat:  cat <CFG_DIR>ds_log.txt
+// ---------------------------------------------------------
+#include <cstdarg>
+#if __has_include(<android/log.h>)
+#include <android/log.h>
+#define DS_HAVE_ALOG 1
+#endif
+
+static void ds_log(int err, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+#ifdef DS_HAVE_ALOG
+    va_list ap2;
+    va_copy(ap2, ap);
+    __android_log_vprint(err ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO, "DSHook", fmt, ap2);
+    va_end(ap2);
+#endif
+    FILE *f = fopen(CFG_DIR "ds_log.txt", "a");
+    if (f) {
+        fputs(err ? "E " : "I ", f);
+        vfprintf(f, fmt, ap);
+        fputc('\n', f);
+        fclose(f);
+    }
+    va_end(ap);
+}
+#undef LOGI
+#undef LOGE
+#define LOGI(...) ds_log(0, __VA_ARGS__)
+#define LOGE(...) ds_log(1, __VA_ARGS__)
+
 static std::set<std::string> g_off;
 
 static void load_cfg() {
@@ -464,6 +498,8 @@ static void install(void *h) {
     if (!domain_get || !attach || !get_asms || !get_image || !image_name || !class_from_name || !method_by_name) {
         LOGE("hook: il2cpp api missing"); return;
     }
+    { FILE *lf = fopen(CFG_DIR "ds_log.txt", "w"); if (lf) fclose(lf); }
+    LOGI("install: start");
     load_cfg();
 
     for (int i = 0; i < 180 && is_vm && !is_vm(nullptr); i++) sleep(1);
