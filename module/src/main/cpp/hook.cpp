@@ -20,7 +20,7 @@ extern "C" void A64HookFunction(void *symbol, void *replace, void **result);
 //                  Missing file or unlisted name = enabled.
 //   sk_cd.txt    : cooldown factor 0.0 - 1.0 (re-read every second).
 //   Names: hp shield delaydead mall gem energy cooldown items dizzy
-//          seasoncoin autoattack
+//          seasoncoin autoattack crit shop goldarmor
 // ---------------------------------------------------------
 #define CFG_DIR "/storage/emulated/0/Android/data/com.ChillyRoom.DungeonShooter/files/"
 
@@ -313,7 +313,119 @@ static void m12setattack_hook(void *self, bool v, bool hand, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 11. Installer
+// 11. Always Crit (not tied to the Precise Strike buff)
+//     DamageTrigger.HandleCritical is the roll. Trigger fields:
+//     critical @0x40, camp @0x64. Camp.Character == 1.
+//     DealDamage is a fallback: forces isCrit for player-camp damage.
+// ---------------------------------------------------------
+static const int CAMP_CHARACTER = 1;
+
+typedef void (*HandleCritical_t)(void *self, void *mi);
+static HandleCritical_t g_handlecrit_orig;
+
+static void handlecrit_hook(void *self, void *mi) {
+    static int logged = 0;
+    if (self) {
+        int camp = *(int *)((char *)self + 0x64);
+        if (camp == CAMP_CHARACTER) {
+            int *p_crit = (int *)((char *)self + 0x40);
+            if (logged < 20) { logged++; LOGI("HandleCritical: camp=%d critical %d -> 10000", camp, *p_crit); }
+            *p_crit = 10000;
+        }
+    }
+    g_handlecrit_orig(self, mi);
+}
+
+struct V3 { float x, y, z; };
+typedef bool (*DealDamage_t)(void *carrier, int damage, bool isCrit, V3 repel, void *target,
+                             void *sourceObj, void *weapon, int sourceCamp, int damageType,
+                             int elementalType, int subType, void *mi);
+static DealDamage_t g_dealdamage_orig;
+
+static bool dealdamage_hook(void *carrier, int damage, bool isCrit, V3 repel, void *target,
+                            void *sourceObj, void *weapon, int sourceCamp, int damageType,
+                            int elementalType, int subType, void *mi) {
+    static int logged = 0;
+    bool crit = (sourceCamp == CAMP_CHARACTER) ? true : isCrit;
+    if (logged < 20) { logged++; LOGI("DealDamage: camp=%d isCrit=%d -> %d dmg=%d", sourceCamp, isCrit, crit, damage); }
+    return g_dealdamage_orig(carrier, damage, crit, repel, target, sourceObj, weapon,
+                             sourceCamp, damageType, elementalType, subType, mi);
+}
+
+// ---------------------------------------------------------
+// 12. Free Shopping (not tied to the On Sales! buff)
+//     BuffStackCfgShopDiscount.GetFinalPriceFactor() is static, no args.
+//     Price multiplier forced to 0. Original value is logged: if it reads
+//     1.00 without the buff and 0.50 with it, 0 = free is correct.
+// ---------------------------------------------------------
+typedef float (*ShopFactor_t)(void *mi);
+static ShopFactor_t g_shopfactor_orig;
+
+static float shopfactor_hook(void *mi) {
+    static int logged = 0;
+    float raw = g_shopfactor_orig ? g_shopfactor_orig(mi) : 1.0f;
+    if (logged < 20) { logged++; LOGI("ShopDiscount.GetFinalPriceFactor: %.2f -> 0.00", raw); }
+    return 0.0f;
+}
+
+// ---------------------------------------------------------
+// 13. Golden Armor+ (not tied to the buff)
+//     Every GOLD_STEP coins owned = +1 max HP and +1 max armor, no cap.
+//     Coin count is captured from CoinChangeEvent.curCoinVal (@0x10) in
+//     RoleAttributePlayer.OnCoinChange and from UpdateArmor(coinVal).
+//     The bonus is added in the max HP / max armor getters.
+// ---------------------------------------------------------
+static const int GOLD_STEP = 10;
+static volatile int g_coin = 0;
+
+static int gold_bonus() { int c = g_coin; return c > 0 ? c / GOLD_STEP : 0; }
+
+typedef void (*OnCoinChange_t)(void *self, void *ev, void *mi);
+static OnCoinChange_t g_oncoin_orig;
+
+static void oncoin_hook(void *self, void *ev, void *mi) {
+    static int logged = 0;
+    if (ev) {
+        int cur = *(int *)((char *)ev + 0x10);
+        if (cur >= 0) g_coin = cur;
+        if (logged < 20) { logged++; LOGI("OnCoinChange: curCoinVal=%d (+%d)", cur, gold_bonus()); }
+    }
+    g_oncoin_orig(self, ev, mi);
+}
+
+typedef void (*UpdateArmorInt_t)(void *self, int coinVal, void *mi);
+static UpdateArmorInt_t g_updarmor_orig;
+
+static void updarmor_hook(void *self, int coinVal, void *mi) {
+    static int logged = 0;
+    if (coinVal >= 0) g_coin = coinVal;
+    if (logged < 20) { logged++; LOGI("UpdateArmor(coinVal=%d)", coinVal); }
+    g_updarmor_orig(self, coinVal, mi);
+}
+
+typedef int (*GetInt_t)(void *self, void *mi);
+static GetInt_t g_getmaxhp_orig;
+static GetInt_t g_getmaxarmor_orig;
+
+static int getmaxhp_hook(void *self, void *mi) {
+    static int logged = 0;
+    int r = g_getmaxhp_orig(self, mi);
+    int b = gold_bonus();
+    if (b > 0 && logged < 20) { logged++; LOGI("max_hp %d -> %d", r, r + b); }
+    return r + b;
+}
+
+static int getmaxarmor_hook(void *self, void *mi) {
+    static int logged = 0;
+    int r = g_getmaxarmor_orig(self, mi);
+    int b = gold_bonus();
+    if (r <= 0 || b <= 0) return r;   // characters without armor stay without
+    if (logged < 20) { logged++; LOGI("max_armor %d -> %d", r, r + b); }
+    return r + b;
+}
+
+// ---------------------------------------------------------
+// 14. Installer
 // ---------------------------------------------------------
 typedef void *(*ClassFromName_t)(void *, const char *, const char *);
 typedef void *(*MethodByName_t)(void *, const char *, int);
@@ -474,6 +586,31 @@ static void install(void *h) {
              (void *) hastags_hook, (void **) &g_hastags_orig);
         hook(image, "", "MythicWeapon12", "SetAttack", 2,
              (void *) m12setattack_hook, (void **) &g_m12setattack_orig);
+    }
+
+    // --- crit: always crit for player-camp damage ---
+    if (on("crit")) {
+        hook(image, "", "DamageTrigger", "HandleCritical", 0,
+             (void *) handlecrit_hook, (void **) &g_handlecrit_orig);
+        hook(image, "", "DamageCarrierHelper", "DealDamage", 11,
+             (void *) dealdamage_hook, (void **) &g_dealdamage_orig);
+    }
+
+    // --- shop: price factor forced to 0 ---
+    if (on("shop"))
+        hook(image, "RGScript.Battle", "BuffStackCfgShopDiscount", "GetFinalPriceFactor", 0,
+             (void *) shopfactor_hook, (void **) &g_shopfactor_orig);
+
+    // --- goldarmor: +1 max HP and +1 max armor per GOLD_STEP coins ---
+    if (on("goldarmor")) {
+        hook(image, "", "RoleAttributePlayer", "OnCoinChange", 1,
+             (void *) oncoin_hook, (void **) &g_oncoin_orig);
+        hook(image, "", "RoleAttributePlayer", "UpdateArmor", 1,
+             (void *) updarmor_hook, (void **) &g_updarmor_orig);
+        hook(image, "", "RoleAttributePlayer", "get_max_hp", 0,
+             (void *) getmaxhp_hook, (void **) &g_getmaxhp_orig);
+        hook(image, "", "RoleAttributePlayer", "get_Max_armor", 0,
+             (void *) getmaxarmor_hook, (void **) &g_getmaxarmor_orig);
     }
 }
 
