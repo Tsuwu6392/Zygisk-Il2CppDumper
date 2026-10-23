@@ -302,6 +302,16 @@ static bool hastags_hook(void *self, void *mi) {
     return r;
 }
 
+typedef void (*M12SetAttack_t)(void *self, bool v, bool hand, void *mi);
+static M12SetAttack_t g_m12setattack_orig;
+
+static void m12setattack_hook(void *self, bool v, bool hand, void *mi) {
+    static int logged = 0;
+    bool inb = g_inbattle && g_inbattle(g_inbattle_mi);
+    if (logged < 20) { logged++; LOGI("M12.SetAttack v=%d hand=%d inbattle=%d", v, hand, inb); }
+    g_m12setattack_orig(self, inb ? true : v, hand, mi);
+}
+
 // ---------------------------------------------------------
 // 11. Installer
 // ---------------------------------------------------------
@@ -462,6 +472,8 @@ static void install(void *h) {
              (void *) autoattack_hook<1>, (void **) &g_autoattack_orig[1]);
         hook(image, "", "RGWeapon", "get_HasAutoAttackTags", 0,
              (void *) hastags_hook, (void **) &g_hastags_orig);
+        hook(image, "", "MythicWeapon12", "SetAttack", 2,
+             (void *) m12setattack_hook, (void **) &g_m12setattack_orig);
     }
 }
 
