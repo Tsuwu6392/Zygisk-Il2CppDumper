@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -146,17 +147,20 @@ static void adddead_hook(void *self, void *src, void *mi) {
 // ---------------------------------------------------------
 // 3. Mall Hooks (Free In-Game Purchases)
 // ---------------------------------------------------------
-typedef void (*BuyItem_t)(void *self, void *mallItem, void *onDone, void *mi);
+// BuyItem returns MallPayResult. R16 passes back whatever the original returned
+// in x0/x1 (covers enum, reference and small struct), so the result is never lost.
+struct R16 { uint64_t a, b; };
+typedef R16 (*BuyItem_t)(void *self, void *mallItem, void *onDone, void *mi);
 static BuyItem_t g_buyitem_orig;
 
-static void buyitem_hook(void *self, void *mallItem, void *onDone, void *mi) {
+static R16 buyitem_hook(void *self, void *mallItem, void *onDone, void *mi) {
     static int logged = 0;
     if (logged < 20) { logged++; LOGI("BuyItem hit! Forcing price to 0."); }
     if (mallItem) {
         *(int *)((char *)mallItem + 0x24) = 0;
         *(int *)((char *)mallItem + 0x28) = 0;
     }
-    g_buyitem_orig(self, mallItem, onDone, mi);
+    return g_buyitem_orig(self, mallItem, onDone, mi);
 }
 
 typedef bool (*HasEnough_t)(void *mallItem, void *mi);
@@ -171,13 +175,15 @@ static bool hasenough_hook(void *mallItem, void *mi) {
 // ---------------------------------------------------------
 // 4. RGSaveManager Hooks (Free Gem Purchases Outside Dungeon)
 // ---------------------------------------------------------
-typedef void (*ConsumeGem_t)(void *self, int amount, bool unk1, bool unk2, void *mi);
+typedef bool (*ConsumeGem_t)(void *self, int amount, bool unk1, bool unk2, void *mi);
 static ConsumeGem_t g_consumegem_orig;
 
-static void consumegem_hook(void *self, int amount, bool unk1, bool unk2, void *mi) {
+// ConsumeGem returns Boolean (success); the caller checks it.
+static bool consumegem_hook(void *self, int amount, bool unk1, bool unk2, void *mi) {
     static int logged = 0;
     if (logged < 20) { logged++; LOGI("ConsumeGem intercepted! Original cost: %d -> Forcing 0", amount); }
     g_consumegem_orig(self, 0, unk1, unk2, mi);
+    return true;
 }
 
 // ---------------------------------------------------------
@@ -235,22 +241,10 @@ static float calcfinalcd_hook(void *self, float cd, void *mi) {
 // ---------------------------------------------------------
 // 7. No Change: Materials, Seeds, Vouchers, Fish Chips (ItemData)
 // ---------------------------------------------------------
-typedef void (*ConsumeMat3_t)(void *self, void *itemName, int count, bool needRecord, void *mi);
-static ConsumeMat3_t g_consumemat3_orig;
-static void consumemat3_hook(void *self, void *itemName, int count, bool needRecord, void *mi) {
+// ConsumeMaterial has 4 overloads (string x2, Dictionary x2); all are blocked.
+static void consumemat_hook(void *self) {
     static int logged = 0;
-    if (logged < 20) { logged++; LOGI("ConsumeMaterial(3) blocked: count=%d", count); }
-}
-
-typedef void (*ConsumeMat6_t)(void *self, void *itemName, int count,
-                               bool save, bool needRecord, bool fromActivity,
-                               void *trackReason, void *mi);
-static ConsumeMat6_t g_consumemat6_orig;
-static void consumemat6_hook(void *self, void *itemName, int count,
-                              bool save, bool needRecord, bool fromActivity,
-                              void *trackReason, void *mi) {
-    static int logged = 0;
-    if (logged < 20) { logged++; LOGI("ConsumeMaterial(6) blocked: count=%d", count); }
+    if (logged < 20) { logged++; LOGI("ConsumeMaterial blocked"); }
 }
 
 typedef void (*ConsumeSeed_t)(void *self, void *itemName, void *mi);
@@ -396,19 +390,69 @@ static bool dealdamage_hook(void *carrier, int damage, bool isCrit, V3 repel, vo
 }
 
 // ---------------------------------------------------------
-// 12. Free Shopping (not tied to the On Sales! buff)
-//     BuffStackCfgShopDiscount.GetFinalPriceFactor() is static, no args.
-//     Price multiplier forced to 0. Original value is logged: if it reads
-//     1.00 without the buff and 0.50 with it, 0 = free is correct.
+// 12. Free Shopping (not tied to the buff)
+//     Price code does: if (BattleData.HasBuff(ExpertShop=10))
+//         price = ceil(price * 0.5 * DataUtil.CalBuffExpertShopExtraRate(..)).
+//     1) CalBuffExpertShopExtraRate (called only from price code) returns 0.
+//     2) BattleData.HasBuff(10) returns true, but only when its caller sits
+//        inside one of the price functions, before their rate call. Every
+//        other HasBuff call anywhere in the game gets the real answer.
+//     Everything is resolved by class/method name at runtime (no RVAs), so
+//     it survives updates. A site is used only if a bl to the helper is
+//     found in its first 0x400 bytes; the found offsets are logged.
 // ---------------------------------------------------------
-typedef float (*ShopFactor_t)(void *mi);
-static ShopFactor_t g_shopfactor_orig;
+static const int BUFF_EXPERTSHOP = 10;
 
-static float shopfactor_hook(void *mi) {
+// Price functions, found by name. Each is scanned at install for its first bl
+// to the rate helper; HasBuff(10) is forced only for callers before that bl.
+struct PriceName { const char *cls; const char *m; };
+static const PriceName k_sites[] = {
+    {"ItemSellerDoctor",       "GetItemValue"},
+    {"ItemSellPlaceAttrbute",  "GetItemValue"},
+    {"ItemSellPlaceBallBuff",  "GetItemValue"},
+    {"ObjectBuffman",          "Start"},
+    {"ObjectSlotInGame",       "Start"},
+    {"ObjectVendingMachine",   "Start"},
+    {"RGContainer",            "GetItemValue"},
+    {"RGContainer",            "CalculateItemValue"},
+    {"TalkMercenaryCoinRobot", "GetItemValue"},
+    {"TalkStatue",             "Start"},
+};
+static uintptr_t g_pr_lo[16], g_pr_hi[16];
+static int g_pr_n = 0;
+
+static uintptr_t bl_target(uintptr_t at) {
+    uint32_t ins = *(volatile uint32_t *) at;
+    if ((ins & 0xFC000000u) != 0x94000000u) return 0;
+    int32_t imm = (int32_t)((ins & 0x03FFFFFFu) << 6) >> 6;
+    return at + (intptr_t) imm * 4;
+}
+
+typedef float (*RateFn_t)(float discount, void *mi);
+static RateFn_t g_ratefn_orig;
+
+static float ratefn_hook(float discount, void *mi) {
     static int logged = 0;
-    float raw = g_shopfactor_orig ? g_shopfactor_orig(mi) : 1.0f;
-    if (logged < 20) { logged++; LOGI("ShopDiscount.GetFinalPriceFactor: %.2f -> 0.00", raw); }
+    if (logged < 20) { logged++; LOGI("CalBuffExpertShopExtraRate(%.2f) -> 0.00", discount); }
     return 0.0f;
+}
+
+typedef bool (*HasBuff_t)(void *self, int buff, void *mi);
+static HasBuff_t g_hasbuff_orig;
+
+__attribute__((noinline))
+static bool hasbuff_hook(void *self, int buff, void *mi) {
+    static int logged = 0;
+    bool r = g_hasbuff_orig(self, buff, mi);
+    if (buff != BUFF_EXPERTSHOP || r) return r;
+    uintptr_t ra = (uintptr_t) __builtin_return_address(0);
+    for (int i = 0; i < g_pr_n; i++) {
+        if (ra >= g_pr_lo[i] && ra < g_pr_hi[i]) {
+            if (logged < 20) { logged++; LOGI("HasBuff(10) -> true at price site %d (ra=%p)", i, (void *) ra); }
+            return true;
+        }
+    }
+    return r;
 }
 
 // ---------------------------------------------------------
@@ -416,7 +460,9 @@ static float shopfactor_hook(void *mi) {
 //     Every GOLD_STEP coins owned = +1 max HP and +1 max armor, no cap.
 //     Coin count is captured from CoinChangeEvent.curCoinVal (@0x10) in
 //     RoleAttributePlayer.OnCoinChange and from UpdateArmor(coinVal).
-//     The bonus is added in the max HP / max armor getters.
+//     The bonus is added in RoleAttributeProxy.get_max_hp / get_MaxArmor
+//     (the single source for 330 / 37 callers). Both must return Int32;
+//     the installer checks the return type before hooking.
 // ---------------------------------------------------------
 static const int GOLD_STEP = 10;
 static volatile int g_coin = 0;
@@ -476,13 +522,22 @@ static ClassFromName_t class_from_name;
 static MethodByName_t  method_by_name;
 
 // Resolve class + method by name, then inline-hook it. Logs on every miss and install.
+static void *(*method_ret_type)(void *) = nullptr;
+static int (*type_get_type)(void *) = nullptr;
+static const int IL2CPP_TYPE_I4 = 0x08;
+
 static bool hook(void *img, const char *ns, const char *cls, const char *m, int argc,
-                 void *repl, void **orig) {
+                 void *repl, void **orig, int ret_type = -1) {
     void *k = class_from_name(img, ns, cls);
     if (!k) { LOGE("hook: class %s not found", cls); return false; }
     void *mi = method_by_name(k, m, argc);
     void *addr = mi ? *(void **) mi : nullptr;
     if (!addr) { LOGE("hook: %s.%s(%d) not found", cls, m, argc); return false; }
+    if (ret_type >= 0) {
+        if (!method_ret_type || !type_get_type) { LOGE("hook: %s.%s skipped, return-type API missing", cls, m); return false; }
+        int rt = type_get_type(method_ret_type(mi));
+        if (rt != ret_type) { LOGE("hook: %s.%s skipped, return type 0x%x != 0x%x", cls, m, rt, ret_type); return false; }
+    }
 #if defined(__aarch64__)
     A64HookFunction(addr, repl, orig);
     LOGI("hook: %s.%s @%p installed", cls, m, addr);
@@ -490,6 +545,50 @@ static bool hook(void *img, const char *ns, const char *cls, const char *m, int 
 #else
     return false;
 #endif
+}
+
+// Class lookup: namespace "" first, then any namespace by plain name.
+static size_t (*image_class_count)(void *) = nullptr;
+static void *(*image_get_class)(void *, size_t) = nullptr;
+static const char *(*class_get_name)(void *) = nullptr;
+static void *(*class_get_methods)(void *, void **) = nullptr;
+static const char *(*method_get_name)(void *) = nullptr;
+
+static void *find_class(void *img, const char *name) {
+    void *k = class_from_name(img, "", name);
+    if (k || !image_class_count || !image_get_class || !class_get_name) return k;
+    size_t n = image_class_count(img);
+    for (size_t i = 0; i < n; i++) {
+        void *c = image_get_class(img, i);
+        if (c && !strcmp(class_get_name(c), name)) return c;
+    }
+    return nullptr;
+}
+
+static uintptr_t method_addr(void *img, const char *cls, const char *m, int argc) {
+    void *k = find_class(img, cls);
+    void *mi = k ? method_by_name(k, m, argc) : nullptr;
+    return mi ? (uintptr_t) *(void **) mi : 0;
+}
+
+// Hook EVERY overload of cls.m (method_by_name only returns one per argc).
+// Only for replacements that ignore their arguments and return void.
+static void hook_all_overloads(void *img, const char *cls, const char *m, void *repl) {
+    static void *dummy[16];
+    static int nd = 0;
+    void *k = find_class(img, cls);
+    if (!k || !class_get_methods || !method_get_name) { LOGE("hook: %s overloads unavailable", cls); return; }
+    std::set<void *> done;
+    void *iter = nullptr;
+    while (void *mi = class_get_methods(k, &iter)) {
+        if (strcmp(method_get_name(mi), m) != 0) continue;
+        void *addr = *(void **) mi;
+        if (!addr || !done.insert(addr).second || nd >= 16) continue;
+#if defined(__aarch64__)
+        A64HookFunction(addr, repl, &dummy[nd++]);
+        LOGI("hook: %s.%s overload @%p installed", cls, m, addr);
+#endif
+    }
 }
 
 static void install(void *h) {
@@ -502,6 +601,13 @@ static void install(void *h) {
     auto image_name      = (const char *(*)(void *))        S("il2cpp_image_get_name");
     class_from_name      = (ClassFromName_t)                S("il2cpp_class_from_name");
     method_by_name       = (MethodByName_t)                 S("il2cpp_class_get_method_from_name");
+    method_ret_type      = (void *(*)(void *))              S("il2cpp_method_get_return_type");
+    type_get_type        = (int (*)(void *))                S("il2cpp_type_get_type");
+    image_class_count    = (size_t (*)(void *))             S("il2cpp_image_get_class_count");
+    image_get_class      = (void *(*)(void *, size_t))      S("il2cpp_image_get_class");
+    class_get_name       = (const char *(*)(void *))        S("il2cpp_class_get_name");
+    class_get_methods    = (void *(*)(void *, void **))     S("il2cpp_class_get_methods");
+    method_get_name      = (const char *(*)(void *))        S("il2cpp_method_get_name");
 #undef S
 
     if (!domain_get || !attach || !get_asms || !get_image || !image_name || !class_from_name || !method_by_name) {
@@ -593,10 +699,7 @@ static void install(void *h) {
 
     // --- items: materials, seeds, vouchers, fish chips never consumed ---
     if (on("items")) {
-        hook(image, "", "ItemData", "ConsumeMaterial", 3,
-             (void *) consumemat3_hook, (void **) &g_consumemat3_orig);
-        hook(image, "", "ItemData", "ConsumeMaterial", 6,
-             (void *) consumemat6_hook, (void **) &g_consumemat6_orig);
+        hook_all_overloads(image, "ItemData", "ConsumeMaterial", (void *) consumemat_hook);
         hook(image, "", "ItemData", "ConsumeSeed", 1,
              (void *) consumeseed_hook, (void **) &g_consumeseed_orig);
         hook(image, "", "ItemData", "ConsumeTokenTicket", 2,
@@ -640,21 +743,46 @@ static void install(void *h) {
              (void *) dealdamage_hook, (void **) &g_dealdamage_orig);
     }
 
-    // --- shop: price factor forced to 0 ---
-    if (on("shop"))
-        hook(image, "RGScript.Battle", "BuffStackCfgShopDiscount", "GetFinalPriceFactor", 0,
-             (void *) shopfactor_hook, (void **) &g_shopfactor_orig);
+    // --- shop: HasBuff(10) true inside price code + rate helper 0 ---
+    if (on("shop")) {
+        uintptr_t rate    = method_addr(image, "DataUtil", "CalBuffExpertShopExtraRate", 1);
+        uintptr_t hasbuff = method_addr(image, "BattleData", "HasBuff", 1);
+        if (!rate || !hasbuff) {
+            LOGE("shop: rate=%p hasbuff=%p, not found, skipped", (void *) rate, (void *) hasbuff);
+        } else {
+            for (const PriceName &pn : k_sites) {
+                uintptr_t fn = method_addr(image, pn.cls, pn.m, 0);
+                if (!fn) { LOGE("shop: %s.%s not found", pn.cls, pn.m); continue; }
+                uintptr_t off = 0;
+                for (uintptr_t o = 4; o < 0x400; o += 4)
+                    if (bl_target(fn + o) == rate) { off = o; break; }
+                if (!off || g_pr_n >= 16) { LOGE("shop: %s.%s has no rate call, skipped", pn.cls, pn.m); continue; }
+                g_pr_lo[g_pr_n] = fn;
+                g_pr_hi[g_pr_n] = fn + off;
+                g_pr_n++;
+                LOGI("shop: %s.%s rate call at +0x%x", pn.cls, pn.m, (unsigned) off);
+            }
+            LOGI("shop: %d price sites found", g_pr_n);
+#if defined(__aarch64__)
+            if (g_pr_n > 0) {
+                A64HookFunction((void *) rate, (void *) ratefn_hook, (void **) &g_ratefn_orig);
+                A64HookFunction((void *) hasbuff, (void *) hasbuff_hook, (void **) &g_hasbuff_orig);
+                LOGI("shop: hooks installed (rate=%p hasbuff=%p)", (void *) rate, (void *) hasbuff);
+            }
+#endif
+        }
+    }
 
-    // --- goldarmor: +1 max HP and +1 max armor per GOLD_STEP coins ---
+    // --- goldarmor: +1 max HP and +1 max armor per GOLD_STEP coins (proxy getters only) ---
     if (on("goldarmor")) {
         hook(image, "", "RoleAttributePlayer", "OnCoinChange", 1,
              (void *) oncoin_hook, (void **) &g_oncoin_orig);
         hook(image, "", "RoleAttributePlayer", "UpdateArmor", 1,
              (void *) updarmor_hook, (void **) &g_updarmor_orig);
-        hook(image, "", "RoleAttributePlayer", "get_max_hp", 0,
-             (void *) getmaxhp_hook, (void **) &g_getmaxhp_orig);
-        hook(image, "", "RoleAttributePlayer", "get_Max_armor", 0,
-             (void *) getmaxarmor_hook, (void **) &g_getmaxarmor_orig);
+        hook(image, "", "RoleAttributeProxy", "get_max_hp", 0,
+             (void *) getmaxhp_hook, (void **) &g_getmaxhp_orig, IL2CPP_TYPE_I4);
+        hook(image, "", "RoleAttributeProxy", "get_MaxArmor", 0,
+             (void *) getmaxarmor_hook, (void **) &g_getmaxarmor_orig, IL2CPP_TYPE_I4);
     }
 }
 
