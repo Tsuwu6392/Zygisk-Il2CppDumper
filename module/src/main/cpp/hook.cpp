@@ -7,6 +7,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <sys/mman.h>
 #include "log.h"
 #include "xdl.h"
 
@@ -124,14 +125,25 @@ static void *const g_repl[3] = {(void *) hurt_hook<0>, (void *) hurt_hook<1>, (v
 typedef bool (*Consume_t)(void *self, void *ev, void *mi);
 static Consume_t g_consume_orig;
 
+// The game keeps the real count in runtime data, keyed by _netId (@0x20).
+// SyncShieldCountFromRuntimeData reads it and overwrites _shieldCount (@0x18);
+// SaveShieldCount writes @0x18 into it. Restoring only the field gets undone
+// by the next sync, so after restoring we call SaveShieldCount to put the
+// restored count back into the runtime data.
+typedef void (*SaveShield_t)(void *self, void *mi);
+static SaveShield_t g_saveshield = nullptr;
+static int g_shield_off = 0x18;   // _shieldCount, resolved by name at install
+static void *g_saveshield_mi = nullptr;
+
 static bool consume_hook(void *self, void *ev, void *mi) {
     static int logged = 0;
-    int before = self ? *(int *)((char *)self + 0x18) : 0;
+    int before = self ? *(int *)((char *)self + g_shield_off) : 0;
     bool r = g_consume_orig(self, ev, mi);
     if (self && before > 0) {
-        int after = *(int *)((char *)self + 0x18);
-        if (logged < 20) { logged++; LOGI("VoidShield consume: count %d -> %d", before, after); }
-        *(int *)((char *)self + 0x18) = before;
+        int after = *(int *)((char *)self + g_shield_off);
+        *(int *)((char *)self + g_shield_off) = before;
+        if (after != before && g_saveshield) g_saveshield(self, g_saveshield_mi);
+        if (logged < 20) { logged++; LOGI("VoidShield consume: count %d -> %d, restored to %d (saved=%d)", before, after, before, (int) (g_saveshield != nullptr)); }
     }
     return r;
 }
@@ -214,15 +226,22 @@ static void setenergy_hook(void *self, int value, void *mi) {
 // ---------------------------------------------------------
 // 6. Skill Cooldown Hooks (SkillInfo)
 // ---------------------------------------------------------
+// get_FinalCooldown calls CalculateFinalCooldown inside (the log showed the
+// raw value of the first equal to the hooked result of the second), so scaling
+// both would apply the factor twice. A thread-local flag makes it apply once.
+static thread_local bool g_cd_applied = false;
+
 typedef float (*GetFinalCd_t)(void *self, void *mi);
 static GetFinalCd_t g_getfinalcd_orig;
 
 static float getfinalcd_hook(void *self, void *mi) {
     static int logged = 0;
+    g_cd_applied = false;
     float raw = g_getfinalcd_orig(self, mi);
     float factor = get_cd_factor();
-    float result = raw * factor;
-    if (logged < 20) { logged++; LOGI("SkillInfo.get_FinalCooldown: %.2f -> %.2f (factor=%.2f)", raw, result, factor); }
+    float result = g_cd_applied ? raw : raw * factor;
+    if (logged < 20) { logged++; LOGI("SkillInfo.get_FinalCooldown: %.2f -> %.2f (factor=%.2f, inner=%d)", raw, result, factor, (int) g_cd_applied); }
+    g_cd_applied = false;
     return result;
 }
 
@@ -234,6 +253,7 @@ static float calcfinalcd_hook(void *self, float cd, void *mi) {
     float raw = g_calcfinalcd_orig(self, cd, mi);
     float factor = get_cd_factor();
     float result = raw * factor;
+    g_cd_applied = true;
     if (logged < 20) { logged++; LOGI("SkillInfo.CalculateFinalCooldown: %.2f -> %.2f (factor=%.2f)", raw, result, factor); }
     return result;
 }
@@ -417,6 +437,8 @@ static const PriceName k_sites[] = {
     {"RGContainer",            "CalculateItemValue"},
     {"TalkMercenaryCoinRobot", "GetItemValue"},
     {"TalkStatue",             "Start"},
+    {"ContainerItemBase",      "GetItemValue"},
+    {"GunCoin",                "DoConsume"},
 };
 static uintptr_t g_pr_lo[16], g_pr_hi[16];
 static int g_pr_n = 0;
@@ -426,6 +448,34 @@ static uintptr_t bl_target(uintptr_t at) {
     if ((ins & 0xFC000000u) != 0x94000000u) return 0;
     int32_t imm = (int32_t)((ins & 0x03FFFFFFu) << 6) >> 6;
     return at + (intptr_t) imm * 4;
+}
+
+// Price code ends with  cmp Wn,#1 ; csinc Wd,Wn,wzr,gt  = max(1, price).
+// That clamp makes the cheapest possible price 1 (2 after the factor-106
+// doubling), so a rate of 0 alone is not free. The csinc is replaced by
+// mov Wd,Wn so 0 passes through.
+static bool patch_u32(uintptr_t at, uint32_t val) {
+    uintptr_t pg = at & ~(uintptr_t) 4095;
+    if (mprotect((void *) pg, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
+    *(volatile uint32_t *) at = val;
+    __builtin___clear_cache((char *) at, (char *) at + 4);
+    mprotect((void *) pg, 4096, PROT_READ | PROT_EXEC);
+    return *(volatile uint32_t *) at == val;
+}
+
+static bool patch_clamp(uintptr_t rate_call, uintptr_t *where) {
+    for (uintptr_t a = rate_call + 8; a < rate_call + 0x100; a += 4) {
+        uint32_t ins  = *(volatile uint32_t *) a;
+        uint32_t prev = *(volatile uint32_t *) (a - 4);
+        if ((ins & 0xFFFFFC00u) == 0x1A9FC400u &&            // csinc Wd, Wn, wzr, gt
+            (prev & 0xFFFFFC1Fu) == 0x7100041Fu &&           // cmp Wn, #1
+            ((prev >> 5) & 31) == ((ins >> 5) & 31)) {
+            uint32_t rn = (ins >> 5) & 31, rd = ins & 31;
+            *where = a;
+            return patch_u32(a, 0x2A0003E0u | (rn << 16) | rd);   // mov Wd, Wn
+        }
+    }
+    return false;
 }
 
 typedef float (*RateFn_t)(float discount, void *mi);
@@ -440,15 +490,16 @@ static float ratefn_hook(float discount, void *mi) {
 typedef bool (*HasBuff_t)(void *self, int buff, void *mi);
 static HasBuff_t g_hasbuff_orig;
 
+static int g_site_hits[16];
+
 __attribute__((noinline))
 static bool hasbuff_hook(void *self, int buff, void *mi) {
-    static int logged = 0;
     bool r = g_hasbuff_orig(self, buff, mi);
     if (buff != BUFF_EXPERTSHOP || r) return r;
     uintptr_t ra = (uintptr_t) __builtin_return_address(0);
     for (int i = 0; i < g_pr_n; i++) {
         if (ra >= g_pr_lo[i] && ra < g_pr_hi[i]) {
-            if (logged < 20) { logged++; LOGI("HasBuff(10) -> true at price site %d (ra=%p)", i, (void *) ra); }
+            if (g_site_hits[i] < 3) { g_site_hits[i]++; LOGI("HasBuff(10) -> true at price site %d (ra=%p)", i, (void *) ra); }
             return true;
         }
     }
@@ -522,31 +573,6 @@ static ClassFromName_t class_from_name;
 static MethodByName_t  method_by_name;
 
 // Resolve class + method by name, then inline-hook it. Logs on every miss and install.
-static void *(*method_ret_type)(void *) = nullptr;
-static int (*type_get_type)(void *) = nullptr;
-static const int IL2CPP_TYPE_I4 = 0x08;
-
-static bool hook(void *img, const char *ns, const char *cls, const char *m, int argc,
-                 void *repl, void **orig, int ret_type = -1) {
-    void *k = class_from_name(img, ns, cls);
-    if (!k) { LOGE("hook: class %s not found", cls); return false; }
-    void *mi = method_by_name(k, m, argc);
-    void *addr = mi ? *(void **) mi : nullptr;
-    if (!addr) { LOGE("hook: %s.%s(%d) not found", cls, m, argc); return false; }
-    if (ret_type >= 0) {
-        if (!method_ret_type || !type_get_type) { LOGE("hook: %s.%s skipped, return-type API missing", cls, m); return false; }
-        int rt = type_get_type(method_ret_type(mi));
-        if (rt != ret_type) { LOGE("hook: %s.%s skipped, return type 0x%x != 0x%x", cls, m, rt, ret_type); return false; }
-    }
-#if defined(__aarch64__)
-    A64HookFunction(addr, repl, orig);
-    LOGI("hook: %s.%s @%p installed", cls, m, addr);
-    return true;
-#else
-    return false;
-#endif
-}
-
 // Class lookup: namespace "" first, then any namespace by plain name.
 static size_t (*image_class_count)(void *) = nullptr;
 static void *(*image_get_class)(void *, size_t) = nullptr;
@@ -554,15 +580,34 @@ static const char *(*class_get_name)(void *) = nullptr;
 static void *(*class_get_methods)(void *, void **) = nullptr;
 static const char *(*method_get_name)(void *) = nullptr;
 
-static void *find_class(void *img, const char *name) {
-    void *k = class_from_name(img, "", name);
-    if (k || !image_class_count || !image_get_class || !class_get_name) return k;
+static const char *(*class_get_ns)(void *) = nullptr;
+static void *(*asm_get_image)(void *) = nullptr;
+static const char *(*img_get_name)(void *) = nullptr;
+static void **g_asms = nullptr;
+static size_t g_nasms = 0;
+
+static void *scan_image(void *img, const char *name) {
+    if (!image_class_count || !image_get_class || !class_get_name) return nullptr;
     size_t n = image_class_count(img);
     for (size_t i = 0; i < n; i++) {
         void *c = image_get_class(img, i);
         if (c && !strcmp(class_get_name(c), name)) return c;
     }
     return nullptr;
+}
+
+// Class lookup: namespace "" in img, then by plain name in img, then in every assembly.
+static void *find_class(void *img, const char *name) {
+    void *k = class_from_name(img, "", name);
+    if (k) return k;
+    k = scan_image(img, name);
+    for (size_t i = 0; !k && i < g_nasms && asm_get_image; i++) {
+        void *im = asm_get_image(g_asms[i]);
+        if (im && im != img) k = scan_image(im, name);
+    }
+    if (k) LOGI("find_class: %s found by scan (ns='%s')", name, class_get_ns ? class_get_ns(k) : "?");
+    else LOGE("find_class: %s not found in any assembly", name);
+    return k;
 }
 
 static uintptr_t method_addr(void *img, const char *cls, const char *m, int argc) {
@@ -591,6 +636,34 @@ static void hook_all_overloads(void *img, const char *cls, const char *m, void *
     }
 }
 
+static void *(*class_get_field)(void *, const char *) = nullptr;
+static int (*field_get_offset)(void *) = nullptr;
+static void *(*method_ret_type)(void *) = nullptr;
+static int (*type_get_type)(void *) = nullptr;
+static const int IL2CPP_TYPE_I4 = 0x08;
+
+static bool hook(void *img, const char *ns, const char *cls, const char *m, int argc,
+                 void *repl, void **orig, int ret_type = -1) {
+    void *k = class_from_name(img, ns, cls);
+    if (!k && !*ns) k = find_class(img, cls);
+    if (!k) { LOGE("hook: class %s not found", cls); return false; }
+    void *mi = method_by_name(k, m, argc);
+    void *addr = mi ? *(void **) mi : nullptr;
+    if (!addr) { LOGE("hook: %s.%s(%d) not found", cls, m, argc); return false; }
+    if (ret_type >= 0) {
+        if (!method_ret_type || !type_get_type) { LOGE("hook: %s.%s skipped, return-type API missing", cls, m); return false; }
+        int rt = type_get_type(method_ret_type(mi));
+        if (rt != ret_type) { LOGE("hook: %s.%s skipped, return type 0x%x != 0x%x", cls, m, rt, ret_type); return false; }
+    }
+#if defined(__aarch64__)
+    A64HookFunction(addr, repl, orig);
+    LOGI("hook: %s.%s @%p installed", cls, m, addr);
+    return true;
+#else
+    return false;
+#endif
+}
+
 static void install(void *h) {
 #define S(n) xdl_sym(h, n, nullptr)
     auto is_vm           = (bool  (*)(void *))              S("il2cpp_is_vm_thread");
@@ -608,6 +681,11 @@ static void install(void *h) {
     class_get_name       = (const char *(*)(void *))        S("il2cpp_class_get_name");
     class_get_methods    = (void *(*)(void *, void **))     S("il2cpp_class_get_methods");
     method_get_name      = (const char *(*)(void *))        S("il2cpp_method_get_name");
+    class_get_ns         = (const char *(*)(void *))        S("il2cpp_class_get_namespace");
+    class_get_field      = (void *(*)(void *, const char *)) S("il2cpp_class_get_field_from_name");
+    field_get_offset     = (int (*)(void *))                S("il2cpp_field_get_offset");
+    asm_get_image        = get_image;
+    img_get_name         = image_name;
 #undef S
 
     if (!domain_get || !attach || !get_asms || !get_image || !image_name || !class_from_name || !method_by_name) {
@@ -620,6 +698,7 @@ static void install(void *h) {
     void *domain = domain_get();
     attach(domain);
 
+    { size_t n0 = 0; void **a0 = get_asms(domain, &n0); g_asms = a0; g_nasms = n0; }
     void *image = nullptr;
     for (int i = 0; i < 60 && !image; i++) {
         size_t n = 0;
@@ -662,9 +741,24 @@ static void install(void *h) {
     }
 
     // --- shield: infinite void shield ---
-    if (on("shield"))
+    if (on("shield")) {
+        void *vk = class_from_name(image, "TalentImpl", "BuffImplVoidShield");
+        if (!vk) vk = find_class(image, "BuffImplVoidShield");
+        if (vk && class_get_field && field_get_offset) {
+            void *fld = class_get_field(vk, "_shieldCount");
+            int off = fld ? field_get_offset(fld) : -1;
+            if (off > 0 && off < 0x200) { g_shield_off = off; LOGI("shield: _shieldCount offset 0x%x (by name)", off); }
+            else LOGE("shield: _shieldCount field not found, using 0x%x", g_shield_off);
+        }
+        void *smi = vk ? method_by_name(vk, "SaveShieldCount", 0) : nullptr;
+        if (smi && *(void **) smi) {
+            g_saveshield = (SaveShield_t) *(void **) smi;
+            g_saveshield_mi = smi;
+            LOGI("shield: SaveShieldCount resolved @%p", (void *) g_saveshield);
+        } else LOGE("shield: SaveShieldCount not found, count will not persist");
         hook(image, "TalentImpl", "BuffImplVoidShield", "OnBeforePlayerConsumeVoidShield", 1,
              (void *) consume_hook, (void **) &g_consume_orig);
+    }
 
     // --- delaydead: block the second-life countdown ---
     if (on("delaydead"))
@@ -761,6 +855,9 @@ static void install(void *h) {
                 g_pr_hi[g_pr_n] = fn + off;
                 g_pr_n++;
                 LOGI("shop: %s.%s rate call at +0x%x", pn.cls, pn.m, (unsigned) off);
+                uintptr_t at = 0;
+                if (patch_clamp(fn + off, &at)) LOGI("shop: %s.%s min-price clamp removed at +0x%x", pn.cls, pn.m, (unsigned) (at - fn));
+                else LOGE("shop: %s.%s min-price clamp NOT found/patched", pn.cls, pn.m);
             }
             LOGI("shop: %d price sites found", g_pr_n);
 #if defined(__aarch64__)
