@@ -623,6 +623,7 @@ static int getmaxarmor_hook(void *self, void *mi) {
 //       applies the chosen skin in game (the false path was not read; true
 //       takes the path of any owned skin).
 //     - ChooseHeroModel.GetSkillIndex is NOT listed (its use was not proven).
+//     - Start button: see doheroconfirm_hook below (state bits 0x10 / 0x8).
 //     Not proven statically: whether starting a run with a hero whose save
 //     entry says locked passes every later check in the game. If not, the
 //     visible effect is only that the run does not start; no save is written.
@@ -651,12 +652,19 @@ static void *g_containsskin_mi = nullptr;
 
 static uintptr_t g_acc_hero = 0, g_acc_skin = 0, g_acc_skill = 0;
 
-struct SiteSet { uintptr_t ra[64]; int n; };
+struct SiteSet { uintptr_t ra[64]; int hits[64]; int n; };
 static SiteSet g_sites_hero, g_sites_skin, g_sites_skill;
 
-static bool in_sites(const SiteSet &s, uintptr_t ra) {
-    for (int i = 0; i < s.n; i++) if (s.ra[i] == ra) return true;
-    return false;
+static int site_idx(const SiteSet &s, uintptr_t ra) {
+    for (int i = 0; i < s.n; i++) if (s.ra[i] == ra) return i;
+    return -1;
+}
+
+// Log the first 3 hits of every call site (not a global cap).
+static bool site_log(SiteSet &s, int i) {
+    if (i < 0 || s.hits[i] >= 3) return false;
+    s.hits[i]++;
+    return true;
 }
 
 static const PriceName k_allowed[] = {
@@ -704,51 +712,82 @@ static bool skin_value(int hero, int skin, int *out) {
 
 __attribute__((noinline))
 static bool gethero_hook(int hero, void *mi) {
-    static int logged = 0;
     uintptr_t ra = (uintptr_t) __builtin_return_address(0);
-    if (!in_sites(g_sites_hero, ra) || !hero_entry_exists(hero)) return g_gethero_orig(hero, mi);
-    if (logged < 20) {
-        logged++;
+    int si = site_idx(g_sites_hero, ra);
+    if (si < 0 || !hero_entry_exists(hero)) return g_gethero_orig(hero, mi);
+    if (site_log(g_sites_hero, si)) {
         bool o = g_gethero_orig(hero, mi);
-        LOGI("unlockall: GetHeroUnlock(%d) orig=%d -> 1 (ra=%p)", hero, (int) o, (void *) ra);
+        LOGI("unlockall: GetHeroUnlock(%d) orig=%d -> 1 (site %d, ra=%p)", hero, (int) o, si, (void *) ra);
     }
     return true;
 }
 
 __attribute__((noinline))
 static bool getskin_hook(int hero, int skin, void *mi) {
-    static int logged = 0, kept = 0;
     uintptr_t ra = (uintptr_t) __builtin_return_address(0);
-    int v = 0;
-    if (in_sites(g_sites_skin, ra) && skin >= 0 && g_containsskin &&
-        g_containsskin(hero, skin, g_containsskin_mi) && skin_value(hero, skin, &v)) {
-        if (v == SKIN_HIDDEN_A || v == SKIN_HIDDEN_B) {
-            if (kept < 10) { kept++; LOGI("unlockskin: GetSkinUnlock(%d, %d) value=%d hidden skin, game answer kept", hero, skin, v); }
-            return g_getskin_orig(hero, skin, mi);
+    int si = site_idx(g_sites_skin, ra);
+    if (si >= 0 && skin >= 0 && g_containsskin) {
+        bool has = g_containsskin(hero, skin, g_containsskin_mi);
+        int v = 0;
+        bool ok = has && skin_value(hero, skin, &v);
+        if (ok && v != SKIN_HIDDEN_A && v != SKIN_HIDDEN_B) {
+            if (site_log(g_sites_skin, si)) {
+                bool o = g_getskin_orig(hero, skin, mi);
+                LOGI("unlockskin: GetSkinUnlock(%d, %d) value=%d orig=%d -> 1 (site %d, ra=%p)", hero, skin, v, (int) o, si, (void *) ra);
+            }
+            return true;
         }
-        if (logged < 20) {
-            logged++;
-            bool o = g_getskin_orig(hero, skin, mi);
-            LOGI("unlockskin: GetSkinUnlock(%d, %d) value=%d orig=%d -> 1 (ra=%p)", hero, skin, v, (int) o, (void *) ra);
-        }
-        return true;
+        if (site_log(g_sites_skin, si))
+            LOGI("unlockskin: GetSkinUnlock(%d, %d) game answer kept (contains=%d value-ok=%d value=%d, site %d)", hero, skin, (int) has, (int) ok, v, si);
     }
     return g_getskin_orig(hero, skin, mi);
 }
 
 __attribute__((noinline))
 static bool newgetskill_hook(int hero, int skill, void *mi) {
-    static int logged = 0;
     uintptr_t ra = (uintptr_t) __builtin_return_address(0);
-    if (in_sites(g_sites_skill, ra) && skill >= 0 && hero_entry_exists(hero)) {
-        if (logged < 20) {
-            logged++;
+    int si = site_idx(g_sites_skill, ra);
+    if (si >= 0 && skill >= 0 && hero_entry_exists(hero)) {
+        if (site_log(g_sites_skill, si)) {
             bool o = g_newgetskill_orig(hero, skill, mi);
-            LOGI("unlockskill: NewGetSkillUnlock(%d, %d) orig=%d -> 1 (ra=%p)", hero, skill, (int) o, (void *) ra);
+            LOGI("unlockskill: NewGetSkillUnlock(%d, %d) orig=%d -> 1 (site %d, ra=%p)", hero, skill, (int) o, si, (void *) ra);
         }
         return true;
     }
     return g_newgetskill_orig(hero, skill, mi);
+}
+
+// ChooseHeroModel.DoHeroConfirmButtonState builds the Start button state in
+// data.confirmButtonState (live disassembly): 1 = plain Start; flags 0x10 = skin
+// not unlocked (its GetSkinUnlock call), 0x8 = GetSkillUnlockedWithTrialed false,
+// 0x4 = hero locked and not trialed; 2 / 0x40 / 0x80 / 0x20 are ticket, trial and
+// ad states. ChooseHeroView.RefreshConfirmButton draws states 1, 2, 32, 64, 128
+// normally and every other value (0, 4, 8, 16, 9, 17, ...) greyed.
+// After the original runs, the state is set to 1 when the hero's data says
+// unlocked and the only bits set are ones our own groups answer for. All other
+// states (ticket, trial, ad) are left to the game.
+static int g_off_modeldata = 0x28;   // Model<T>.data inside ChooseHeroModel, resolved by name
+static int g_cd_id    = 0x00;        // ChooseHeroData.id               (il2cpp offset - 0x10)
+static int g_cd_unl   = 0x04;        // ChooseHeroData.unlocked
+static int g_cd_state = 0x98;        // ChooseHeroData.confirmButtonState
+static int g_conf_mask = 0;
+typedef void (*DoHeroConfirm_t)(void *self, void *mi);
+static DoHeroConfirm_t g_doheroconfirm_orig;
+
+static void doheroconfirm_hook(void *self, void *mi) {
+    static int logged = 0, changed = 0;
+    g_doheroconfirm_orig(self, mi);
+    if (!self || !g_conf_mask) return;
+    char *d = (char *) self + g_off_modeldata;
+    int hero = *(int *) (d + g_cd_id);
+    bool unl = *(volatile unsigned char *) (d + g_cd_unl) != 0;
+    int *ps = (int *) (d + g_cd_state);
+    int s = *ps;
+    if (logged < 12) { logged++; LOGI("unlock: confirm state hero=%d unlocked=%d state=0x%x", hero, (int) unl, s); }
+    if (s != 1 && unl && (s & ~g_conf_mask) == 0 && hero_entry_exists(hero)) {
+        *ps = 1;
+        if (changed < 12) { changed++; LOGI("unlock: confirm state hero=%d 0x%x -> 1", hero, s); }
+    }
 }
 
 // ---------------------------------------------------------
@@ -945,6 +984,17 @@ static void scan_sites(void *img, const char *cls, const char *m) {
     }
 }
 
+// Address of the first method named m in cls, found by iterating the class
+// methods (never method_by_name: it runs Class::Init, see lessons).
+static uintptr_t iter_method_addr(void *img, const char *cls, const char *m) {
+    void *k = find_class(img, cls);
+    if (!k || !class_get_methods || !method_get_name) return 0;
+    void *it = nullptr;
+    while (void *mi = class_get_methods(k, &it))
+        if (!strcmp(method_get_name(mi), m)) return (uintptr_t) *(void **) mi;
+    return 0;
+}
+
 static void install(void *h) {
 #define S(n) xdl_sym(h, n, nullptr)
     auto is_vm           = (bool  (*)(void *))              S("il2cpp_is_vm_thread");
@@ -1021,6 +1071,10 @@ static void install(void *h) {
     if (on("unlockall") || on("unlockskill") || on("unlockskin")) {
         g_off_charlist = resolve_off(image, "RGSaveManager", "char_list", g_off_charlist);
         g_off_skinlist = resolve_off(image, "RGCharacterInfo", "skin_list", g_off_skinlist);
+        g_off_modeldata = resolve_off(image, "ChooseHeroModel", "data", g_off_modeldata);
+        g_cd_id    = resolve_off(image, "ChooseHeroData", "id", g_cd_id + 0x10) - 0x10;
+        g_cd_unl   = resolve_off(image, "ChooseHeroData", "unlocked", g_cd_unl + 0x10) - 0x10;
+        g_cd_state = resolve_off(image, "ChooseHeroData", "confirmButtonState", g_cd_state + 0x10) - 0x10;
         void *sk = find_class(image, "RGSaveManager");
         void *gmi = sk ? method_by_name(sk, "get_Inst", 0) : nullptr;
         if (gmi && *(void **) gmi) {
@@ -1056,6 +1110,16 @@ static void install(void *h) {
         hook(image, "", "DataUtil", "NewGetSkillUnlock", 2,
              (void *) newgetskill_hook, (void **) &g_newgetskill_orig, IL2CPP_TYPE_BOOLEAN);
     else if (on("unlockskill")) LOGE("unlockskill: no call sites found, hook skipped");
+    g_conf_mask = (on("unlockskin") ? 0x10 : 0) | (on("unlockskill") ? 0x8 : 0);
+    if (g_getinst && g_conf_mask) {
+        uintptr_t ca = iter_method_addr(image, "ChooseHeroModel", "DoHeroConfirmButtonState");
+#if defined(__aarch64__)
+        if (ca) {
+            A64HookFunction((void *) ca, (void *) doheroconfirm_hook, (void **) &g_doheroconfirm_orig);
+            LOGI("unlock: confirm-state hook installed @%p mask=0x%x model.data=0x%x state=0x%x", (void *) ca, g_conf_mask, g_off_modeldata, g_cd_state);
+        } else LOGE("unlock: ChooseHeroModel.DoHeroConfirmButtonState not found, Start state not adjusted");
+#endif
+    }
 
     // --- hp: HurtHp (base + subclass overrides, deduped by address) ---
     if (on("hp")) {
