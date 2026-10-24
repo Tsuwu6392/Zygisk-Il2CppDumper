@@ -22,7 +22,7 @@ extern "C" void A64HookFunction(void *symbol, void *replace, void **result);
 //                  Missing file or unlisted name = enabled.
 //   sk_cd.txt    : cooldown factor 0.0 - 1.0 (re-read every second).
 //   Names: hp shield delaydead mall gem energy cooldown items dizzy
-//          seasoncoin autoattack crit shop goldarmor lockedlevel
+//          seasoncoin autoattack crit shop goldarmor lockedlevel saleday
 // ---------------------------------------------------------
 #define CFG_DIR "/storage/emulated/0/Android/data/com.ChillyRoom.DungeonShooter/files/"
 
@@ -625,7 +625,51 @@ static void refreshunlockarea_hook(void *self, void *data, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 15. Installer
+// 15. Sales Day challenge always active
+//     Sales Day is emBattleFactor 316. BattleData.get_IsSaleDay is
+//         if (get_IsNormalMode()) return CompareFactor(316); else false
+//     and its callers (map structure generation, chest/special room
+//     instantiation, GetSpecialRoomCount, the Lua wrapper) all go through
+//     it. CompareFactor(factor) is the single per-factor check, so it is
+//     hooked: for factor 316 it returns true whenever IsNormalMode is true
+//     (the same gate the game uses). Every other factor (Bad Luck = 103
+//     and the rest) gets the real answer, so no other challenge changes.
+//     Each distinct return address that asks for 316 is logged once, which
+//     shows who reads the factor.
+// ---------------------------------------------------------
+static const int FACTOR_SALEDAY = 316;
+
+typedef bool (*CompareFactor_t)(void *self, int factor, void *mi);
+static CompareFactor_t g_comparefactor_orig;
+
+typedef bool (*IsNormalMode_t)(void *self, void *mi);
+static IsNormalMode_t g_isnormal = nullptr;
+static void *g_isnormal_mi = nullptr;
+
+static thread_local bool g_cf_busy = false;
+static uintptr_t g_cf_seen[24];
+static int g_cf_nseen = 0;
+
+__attribute__((noinline))
+static bool comparefactor_hook(void *self, int factor, void *mi) {
+    bool r = g_comparefactor_orig(self, factor, mi);
+    if (factor != FACTOR_SALEDAY || r || !self || g_cf_busy) return r;
+    g_cf_busy = true;
+    bool normal = g_isnormal ? g_isnormal(self, g_isnormal_mi) : true;
+    g_cf_busy = false;
+    if (!normal) return r;
+    uintptr_t ra = (uintptr_t) __builtin_return_address(0);
+    bool seen = false;
+    for (int i = 0; i < g_cf_nseen; i++) if (g_cf_seen[i] == ra) { seen = true; break; }
+    if (!seen && g_cf_nseen < 24) {
+        g_cf_seen[g_cf_nseen++] = ra;
+        LOGI("saleday: CompareFactor(316) false -> true (ra=%p, site #%d)", (void *) ra, g_cf_nseen);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------
+// 16. Installer
 // ---------------------------------------------------------
 typedef void *(*ClassFromName_t)(void *, const char *, const char *);
 typedef void *(*MethodByName_t)(void *, const char *, int);
@@ -1016,6 +1060,19 @@ static void install(void *h) {
              (void *) getmaxhp_hook, (void **) &g_getmaxhp_orig, IL2CPP_TYPE_I4);
         hook(image, "", "RoleAttributeProxy", "get_MaxArmor", 0,
              (void *) getmaxarmor_hook, (void **) &g_getmaxarmor_orig, IL2CPP_TYPE_I4);
+    }
+
+    // --- saleday: Sales Day challenge (factor 316) always active ---
+    if (on("saleday")) {
+        void *bk = find_class(image, "BattleData");
+        void *nmi = bk ? method_by_name(bk, "get_IsNormalMode", 0) : nullptr;
+        if (nmi && *(void **) nmi) {
+            g_isnormal = (IsNormalMode_t) *(void **) nmi;
+            g_isnormal_mi = nmi;
+            LOGI("saleday: get_IsNormalMode resolved @%p", (void *) g_isnormal);
+        } else LOGE("saleday: BattleData.get_IsNormalMode not found, gate skipped");
+        hook(image, "", "BattleData", "CompareFactor", 1,
+             (void *) comparefactor_hook, (void **) &g_comparefactor_orig);
     }
 }
 
