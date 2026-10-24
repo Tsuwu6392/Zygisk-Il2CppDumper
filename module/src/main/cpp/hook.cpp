@@ -610,6 +610,9 @@ static int getmaxarmor_hook(void *self, void *mi) {
 //                             check stays, so maxed heroes still hide it)
 //     Both are found by pattern inside the function, anchored on the
 //     ChooseHeroData.unlocked offset resolved by name.
+//
+//     BISECT RESULT: stage 1 ok, stage 2 (method lookup) breaks. The patch
+//     code was never the cause. The stages below split the lookup further.
 // ---------------------------------------------------------
 static int g_off_cd_unlocked = 0x4;   // ChooseHeroData.unlocked (raw struct offset; il2cpp reports +0x10)
 
@@ -872,30 +875,53 @@ static void install(void *h) {
         g_off_curcoin = resolve_off(image, "CoinChangeEvent", "curCoinVal", g_off_curcoin);
 
     // --- lockedlevel: show the upgrade button for locked heroes (in-place patch, no hook) ---
-    // Stages (ds_hooks.txt "lockedlevel=N"; default 4), for bisecting a UI break:
+    // Stages (ds_hooks.txt "lockedlevel=N"; default 1 = known safe), for bisecting a UI break.
+    // Known so far: 0 normal, 1 normal, 2 (old numbering: class + method lookup) BREAKS.
     //   1 = resolve ChooseHeroData.unlocked only
-    //   2 = + look up ChooseHeroView.RefreshUnlockArea (no patch)
-    //   3 = + patch tbz only
-    //   4 = + patch the other-button check (full feature)
+    //   2 = + find_class(ChooseHeroView) only, no method lookup
+    //   3 = + method_by_name(RefreshUnlockArea) via class_get_methods iteration
+    //       (no method_by_name call, to tell the two lookups apart)
+    //   4 = same as 3 but via method_by_name
+    //   5 = + patch tbz only
+    //   6 = + patch the other-button check (full feature)
     if (on("lockedlevel")) {
-        int st = stage("lockedlevel", 4);
+        int st = stage("lockedlevel", 1);
         LOGI("lockedlevel: stage %d", st);
         int o = resolve_off(image, "ChooseHeroData", "unlocked", g_off_cd_unlocked + 0x10);
         g_off_cd_unlocked = o >= 0x10 ? o - 0x10 : o;
+        LOGI("lockedlevel: stage 1 done (unlocked raw off 0x%x)", g_off_cd_unlocked);
+        void *kv = nullptr;
+        uintptr_t fn = 0;
         if (st >= 2) {
-            uintptr_t fn = method_addr(image, "ChooseHeroView", "RefreshUnlockArea", 1);
-            if (!fn) {
-                LOGE("lockedlevel: ChooseHeroView.RefreshUnlockArea not found, skipped");
-            } else if (st >= 3) {
-                uintptr_t at_tbz = 0, at_and = 0;
-                if (patch_lockedlevel(fn, g_off_cd_unlocked, st >= 4 ? 2 : 1, &at_tbz, &at_and))
-                    LOGI("lockedlevel: patched RefreshUnlockArea @%p: tbz->nop at +0x%x, and at +0x%x (0 = not patched), unlocked off 0x%x",
-                         (void *) fn, (unsigned) (at_tbz - fn), at_and ? (unsigned) (at_and - fn) : 0u, g_off_cd_unlocked);
-                else
-                    LOGE("lockedlevel: RefreshUnlockArea @%p pattern not found / patch failed, skipped", (void *) fn);
+            kv = find_class(image, "ChooseHeroView");
+            LOGI("lockedlevel: stage 2 done, ChooseHeroView class=%p", kv);
+        }
+        if (st >= 3 && kv) {
+            if (st == 3) {
+                // iterate the method list instead of calling method_by_name
+                if (class_get_methods && method_get_name) {
+                    void *iter = nullptr;
+                    while (void *mi = class_get_methods(kv, &iter)) {
+                        if (strcmp(method_get_name(mi), "RefreshUnlockArea") == 0 && *(void **) mi) {
+                            fn = (uintptr_t) *(void **) mi;
+                            break;
+                        }
+                    }
+                } else LOGE("lockedlevel: class_get_methods API missing");
             } else {
-                LOGI("lockedlevel: RefreshUnlockArea @%p found, not patched (stage %d)", (void *) fn, st);
+                void *mi = method_by_name(kv, "RefreshUnlockArea", 1);
+                fn = mi ? (uintptr_t) *(void **) mi : 0;
             }
+            if (fn) LOGI("lockedlevel: stage %d done, RefreshUnlockArea @%p", st >= 4 ? 4 : 3, (void *) fn);
+            else LOGE("lockedlevel: RefreshUnlockArea not found, skipped");
+        }
+        if (st >= 5 && fn) {
+            uintptr_t at_tbz = 0, at_and = 0;
+            if (patch_lockedlevel(fn, g_off_cd_unlocked, st >= 6 ? 2 : 1, &at_tbz, &at_and))
+                LOGI("lockedlevel: patched RefreshUnlockArea @%p: tbz->nop at +0x%x, and at +0x%x (0 = not patched), unlocked off 0x%x",
+                     (void *) fn, (unsigned) (at_tbz - fn), at_and ? (unsigned) (at_and - fn) : 0u, g_off_cd_unlocked);
+            else
+                LOGE("lockedlevel: RefreshUnlockArea @%p pattern not found / patch failed, skipped", (void *) fn);
         }
     }
 
