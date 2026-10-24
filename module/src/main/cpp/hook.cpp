@@ -583,45 +583,50 @@ static int getmaxarmor_hook(void *self, void *mi) {
 // ---------------------------------------------------------
 // 14. Level up locked heroes (e.g. trial-ticket heroes)
 //     RGSaveManager.HeroLevelUp / ChooseHeroModel.OnUpgradeButtonClicked have
-//     no unlock check (verified in the disassembly). The only gate is the UI:
-//     ChooseHeroView.RefreshUnlockArea shows _upgradeButton only when
-//     data.unlocked && data.level < data.maxLevel. After the original ran, if
-//     the hero is locked and below max level, the button is switched on.
-//     ChooseHeroData is a struct passed by pointer; its field offsets are
-//     resolved by name (il2cpp reports them with the 0x10 object header,
-//     the pointer we get points at the raw struct, so 0x10 is subtracted).
+//     no unlock check (verified in the disassembly). The only gate is
+//     ChooseHeroView.RefreshUnlockArea(ChooseHeroData), which ends with
+//         _upgradeButton.gameObject.SetActive(
+//             data.unlocked && data.level < data.maxLevel && !otherButton.activeSelf)
+//     compiled as
+//         ldrb w8,[x19,#unlocked] ; mov x21,x0 ; tbz w8,#0,<w1=0>
+//         ldp  w8,w9,[x19,#12]    ; cmp w8,w9  ; b.ge <w1=0>
+//         ... otherButton.get_gameObject / get_activeSelf ...
+//         mvn  w8,w0 ; and w1,w8,#1
+//     Hooking that function broke the hero screen (hook never logged a hit),
+//     so it is NOT hooked. Two instructions are patched in place instead
+//     (same technique as the shop clamp):
+//       tbz  -> nop          (locked heroes no longer take the w1=0 path)
+//       and  -> mov w1,#1    (ignore the other-button check; the level < max
+//                             check stays, so maxed heroes still hide it)
+//     Both are found by pattern inside the function, anchored on the
+//     ChooseHeroData.unlocked offset resolved by name.
 // ---------------------------------------------------------
-static int g_off_cd_unlocked = 0x4;     // ChooseHeroData.unlocked (bool)
-static int g_off_cd_level    = 0xc;     // ChooseHeroData.level
-static int g_off_cd_maxlevel = 0x10;    // ChooseHeroData.maxLevel
-static int g_off_cv_upgrade  = 0x1f0;   // ChooseHeroView._upgradeButton (Transform)
+static int g_off_cd_unlocked = 0x4;   // ChooseHeroData.unlocked (raw struct offset; il2cpp reports +0x10)
 
-typedef void *(*GetGO_t)(void *self, void *mi);
-typedef void (*SetActive_t)(void *self, bool on, void *mi);
-static GetGO_t g_getgo = nullptr;
-static void *g_getgo_mi = nullptr;
-static SetActive_t g_setactive = nullptr;
-static void *g_setactive_mi = nullptr;
-
-typedef void (*RefreshUnlockArea_t)(void *self, void *data, void *mi);
-static RefreshUnlockArea_t g_refreshunlock_orig;
-
-static void refreshunlockarea_hook(void *self, void *data, void *mi) {
-    static int logged = 0;
-    g_refreshunlock_orig(self, data, mi);
-    if (!self || !data || !g_getgo || !g_setactive) return;
-    bool unlocked = *(volatile uint8_t *)((char *)data + g_off_cd_unlocked) != 0;
-    int lv = *(int *)((char *)data + g_off_cd_level);
-    int mx = *(int *)((char *)data + g_off_cd_maxlevel);
-    static int seen = 0;
-    if (seen < 12) { seen++; LOGI("lockedlevel: RefreshUnlockArea unlocked=%d level=%d/%d btn=%p", (int) unlocked, lv, mx, *(void **)((char *)self + g_off_cv_upgrade)); }
-    if (unlocked || mx <= 0 || lv >= mx) return;
-    void *btn = *(void **)((char *)self + g_off_cv_upgrade);
-    if (!btn) return;
-    void *go = g_getgo(btn, g_getgo_mi);
-    if (!go) return;
-    g_setactive(go, true, g_setactive_mi);
-    if (logged < 20) { logged++; LOGI("lockedlevel: upgrade button shown for locked hero (level %d/%d)", lv, mx); }
+static bool patch_lockedlevel(uintptr_t fn, int unlocked_off, uintptr_t *at_tbz, uintptr_t *at_and) {
+    // ldrb w8, [x19, #unlocked_off]
+    uint32_t ldrb = 0x39400000u | ((uint32_t) unlocked_off << 10) | (19u << 5) | 8u;
+    for (uintptr_t a = fn; a < fn + 0x800; a += 4) {
+        if (*(volatile uint32_t *) a != ldrb) continue;
+        uintptr_t tbz = a + 8;                                        // ldrb ; mov x21,x0 ; tbz
+        uint32_t t = *(volatile uint32_t *) tbz;
+        if ((t & 0xFFF8001Fu) != 0x36000008u) continue;               // tbz w8, #0, ...
+        for (uintptr_t b = tbz + 4; b < tbz + 0x60; b += 4) {
+            if (*(volatile uint32_t *) b != 0x2A2003E8u) continue;    // mvn w8, w0
+            if (*(volatile uint32_t *) (b + 4) != 0x12000101u) continue;  // and w1, w8, #1
+            uintptr_t pand = b + 4;
+            uint32_t old_and = 0x12000101u;
+            if (!patch_u32(pand, 0x52800021u)) return false;          // mov w1, #1
+            if (!patch_u32(tbz, 0xD503201Fu)) {                       // nop
+                patch_u32(pand, old_and);
+                return false;
+            }
+            *at_tbz = tbz;
+            *at_and = pand;
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------
@@ -855,49 +860,21 @@ static void install(void *h) {
     if (on("goldarmor"))
         g_off_curcoin = resolve_off(image, "CoinChangeEvent", "curCoinVal", g_off_curcoin);
 
-    // --- lockedlevel: show the upgrade button for locked heroes ---
+    // --- lockedlevel: show the upgrade button for locked heroes (in-place patch, no hook) ---
     if (on("lockedlevel")) {
-        int o;
-        o = resolve_off(image, "ChooseHeroData", "unlocked", g_off_cd_unlocked + 0x10);
+        int o = resolve_off(image, "ChooseHeroData", "unlocked", g_off_cd_unlocked + 0x10);
         g_off_cd_unlocked = o >= 0x10 ? o - 0x10 : o;
-        o = resolve_off(image, "ChooseHeroData", "level", g_off_cd_level + 0x10);
-        g_off_cd_level = o >= 0x10 ? o - 0x10 : o;
-        o = resolve_off(image, "ChooseHeroData", "maxLevel", g_off_cd_maxlevel + 0x10);
-        g_off_cd_maxlevel = o >= 0x10 ? o - 0x10 : o;
-        g_off_cv_upgrade = resolve_off(image, "ChooseHeroView", "_upgradeButton", g_off_cv_upgrade);
-        LOGI("lockedlevel: data offsets unlocked=0x%x level=0x%x maxLevel=0x%x", g_off_cd_unlocked, g_off_cd_level, g_off_cd_maxlevel);
-
-        // Unity classes live in UnityEngine.CoreModule, namespace UnityEngine.
-        // get_gameObject is declared on Component (Transform inherits it).
-        void *core = nullptr;
-        for (size_t i = 0; i < g_nasms && !core; i++) {
-            void *im = get_image(g_asms[i]);
-            if (im && !strcmp(image_name(im), "UnityEngine.CoreModule.dll")) core = im;
+        uintptr_t fn = method_addr(image, "ChooseHeroView", "RefreshUnlockArea", 1);
+        if (!fn) {
+            LOGE("lockedlevel: ChooseHeroView.RefreshUnlockArea not found, skipped");
+        } else {
+            uintptr_t at_tbz = 0, at_and = 0;
+            if (patch_lockedlevel(fn, g_off_cd_unlocked, &at_tbz, &at_and))
+                LOGI("lockedlevel: patched RefreshUnlockArea @%p: tbz->nop at +0x%x, and->mov w1,#1 at +0x%x (unlocked off 0x%x)",
+                     (void *) fn, (unsigned) (at_tbz - fn), (unsigned) (at_and - fn), g_off_cd_unlocked);
+            else
+                LOGE("lockedlevel: RefreshUnlockArea @%p pattern not found / patch failed, skipped", (void *) fn);
         }
-        void *ck = core ? class_from_name(core, "UnityEngine", "Component") : nullptr;
-        void *gk = core ? class_from_name(core, "UnityEngine", "GameObject") : nullptr;
-        void *gmi = ck ? method_by_name(ck, "get_gameObject", 0) : nullptr;
-        void *smi = gk ? method_by_name(gk, "SetActive", 1) : nullptr;
-        LOGI("lockedlevel: core=%p Component=%p GameObject=%p get_gameObject=%p SetActive=%p",
-             core, ck, gk, gmi, smi);
-        if (!(gmi && *(void **) gmi && smi && *(void **) smi)) {
-            // fallback: old lookup through Assembly-CSharp / plain-name scan
-            void *tk = find_class(image, "Transform");
-            void *gk2 = find_class(image, "GameObject");
-            gmi = tk ? method_by_name(tk, "get_gameObject", 0) : nullptr;
-            smi = gk2 ? method_by_name(gk2, "SetActive", 1) : nullptr;
-            LOGI("lockedlevel: fallback lookup Transform=%p GameObject=%p get_gameObject=%p SetActive=%p",
-                 tk, gk2, gmi, smi);
-        }
-        if (gmi && *(void **) gmi && smi && *(void **) smi) {
-            g_getgo = (GetGO_t) *(void **) gmi;
-            g_getgo_mi = gmi;
-            g_setactive = (SetActive_t) *(void **) smi;
-            g_setactive_mi = smi;
-            LOGI("lockedlevel: get_gameObject @%p SetActive @%p", (void *) g_getgo, (void *) g_setactive);
-            hook(image, "", "ChooseHeroView", "RefreshUnlockArea", 1,
-                 (void *) refreshunlockarea_hook, (void **) &g_refreshunlock_orig);
-        } else LOGE("lockedlevel: Transform.get_gameObject / GameObject.SetActive not found, skipped");
     }
 
     // --- hp: HurtHp (base + subclass overrides, deduped by address) ---
