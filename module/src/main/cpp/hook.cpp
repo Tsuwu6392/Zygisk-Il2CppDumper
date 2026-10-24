@@ -7,6 +7,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 #include <unistd.h>
 #include <sys/mman.h>
 #include "log.h"
@@ -23,7 +24,8 @@ extern "C" void A64HookFunction(void *symbol, void *replace, void **result);
 //                  Missing file or unlisted name = enabled.
 //   sk_cd.txt    : cooldown factor 0.0 - 1.0 (re-read every second).
 //   Names: hp shield delaydead mall gem energy cooldown items dizzy
-//          seasoncoin autoattack crit shop goldarmor lockedlevel saleday
+//          seasoncoin autoattack crit shop goldarmor saleday unlockall
+//          unlockskin unlockskill
 // ---------------------------------------------------------
 #define CFG_DIR "/storage/emulated/0/Android/data/com.ChillyRoom.DungeonShooter/files/"
 
@@ -591,56 +593,162 @@ static int getmaxarmor_hook(void *self, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 14. Level up locked heroes (e.g. trial-ticket heroes)
-//     RGSaveManager.HeroLevelUp / ChooseHeroModel.OnUpgradeButtonClicked have
-//     no unlock check (verified in the disassembly). The only gate is
-//     ChooseHeroView.RefreshUnlockArea(ChooseHeroData), which ends with
-//         _upgradeButton.gameObject.SetActive(
-//             data.unlocked && data.level < data.maxLevel && !otherButton.activeSelf)
-//     compiled as
-//         ldrb w8,[x19,#unlocked] ; mov x21,x0 ; tbz w8,#0,<w1=0>
-//         ldp  w8,w9,[x19,#12]    ; cmp w8,w9  ; b.ge <w1=0>
-//         ... otherButton.get_gameObject / get_activeSelf ...
-//         mvn  w8,w0 ; and w1,w8,#1
-//     Hooking that function broke the hero screen (hook never logged a hit),
-//     so it is NOT hooked. Two instructions are patched in place instead
-//     (same technique as the shop clamp):
-//       tbz  -> nop          (locked heroes no longer take the w1=0 path)
-//       and  -> mov w1,#1    (ignore the other-button check; the level < max
-//                             check stays, so maxed heroes still hide it)
-//     Both are found by pattern inside the function, anchored on the
-//     ChooseHeroData.unlocked offset resolved by name.
-//
-//     BISECT RESULT: stage 1 ok, stage 2 (method lookup) breaks. The patch
-//     code was never the cause. The stages below split the lookup further.
+// 14. Unlock heroes, skins, skills (unlockall, unlockskin, unlockskill)
+//     Accessors, all static in DataUtil: GetHeroUnlock(hero),
+//     GetSkinUnlock(hero, skin), NewGetSkillUnlock(hero, skill).
+//     Caller scans of live code found 135 / 145 / 34 callers. Many of them
+//     write or grant something based on the answer (ProgressChecker quest
+//     counts, HonoraryTitle, RoomObjectManager achievements and AfterLoadSkins,
+//     RestoreRole, RGSaveManager.UpdateVersion, ItemUtility.AddItem, check-in
+//     ReplaceUnlockedReward, MallData.BuyItemPreCheck). A global "true" could
+//     therefore persist fake progress. So each hook answers true ONLY when its
+//     return address is one of the call sites found inside the methods listed
+//     in k_allowed; every other caller gets the game's own answer.
+//     The sites are found at install: each listed method is located by
+//     iterating class_get_methods (no method_by_name on ChooseHeroModel, see
+//     lessons), and its code up to the next method of the class is scanned for
+//     a bl to the accessor. Names only, no RVAs; found sites are logged.
+//     Evidence for the list (live disassembly):
+//     - ChooseHeroModel.OnShow, MakeSuperHeroDataList, MakeSkinDataList,
+//       RefreshCurrentHeroSkinSkillData fill ChooseHeroData (unlocked, skin
+//       cells, skillsUnlocked) or compare against it and set a refresh flag.
+//       The skin cell constructor stores the inverted GetSkinUnlock result as
+//       its "locked" byte (this+0x14).
+//     - ChooseHeroModel.DoHeroConfirmButtonState: button state only.
+//     - ChooseHeroModel.OnConfirmButtonClicked: resets the chosen skin to 0
+//       when the skin is neither unlocked nor trial.
+//     - RGSaveManager.GetCurrentSkin: returns the saved skin, or 0 when the
+//       skin is locked. No writes.
+//     - RGController.AwakeController: GetSkinUnlock gate at +0x6e0 that
+//       applies the chosen skin in game (the false path was not read; true
+//       takes the path of any owned skin).
+//     - ChooseHeroModel.GetSkillIndex is NOT listed (its use was not proven).
+//     Not proven statically: whether starting a run with a hero whose save
+//     entry says locked passes every later check in the game. If not, the
+//     visible effect is only that the run does not start; no save is written.
+//     Values: hero ids need a char_list entry; skins need DataUtil.ContainsSkin
+//     and a skin_list value other than -3 / -8 (MakeSkinDataList hides those
+//     skins when locked, they stay game-controlled); skills need a hero entry
+//     and skill >= 0 (every NewGetSkillUnlock caller was checked: no loop
+//     depends on the result; see lessons).
 // ---------------------------------------------------------
-static int g_off_cd_unlocked = 0x4;   // ChooseHeroData.unlocked (raw struct offset; il2cpp reports +0x10)
+static int g_off_charlist = 0x20;           // RGSaveManager.char_list, resolved by name
+static int g_off_skinlist = 0x28;           // RGCharacterInfo.skin_list, resolved by name
 
-// mode 1 = only tbz->nop, mode 2 = tbz->nop and and->mov w1,#1
-static bool patch_lockedlevel(uintptr_t fn, int unlocked_off, int mode, uintptr_t *at_tbz, uintptr_t *at_and) {
-    // ldrb w8, [x19, #unlocked_off]
-    uint32_t ldrb = 0x39400000u | ((uint32_t) unlocked_off << 10) | (19u << 5) | 8u;
-    for (uintptr_t a = fn; a < fn + 0x800; a += 4) {
-        if (*(volatile uint32_t *) a != ldrb) continue;
-        uintptr_t tbz = a + 8;                                        // ldrb ; mov x21,x0 ; tbz
-        uint32_t t = *(volatile uint32_t *) tbz;
-        if ((t & 0xFFF8001Fu) != 0x36000008u) continue;               // tbz w8, #0, ...
-        for (uintptr_t b = tbz + 4; b < tbz + 0x60; b += 4) {
-            if (*(volatile uint32_t *) b != 0x2A2003E8u) continue;    // mvn w8, w0
-            if (*(volatile uint32_t *) (b + 4) != 0x12000101u) continue;  // and w1, w8, #1
-            uintptr_t pand = b + 4;
-            uint32_t old_and = 0x12000101u;
-            if (mode >= 2 && !patch_u32(pand, 0x52800021u)) return false;   // mov w1, #1
-            if (!patch_u32(tbz, 0xD503201Fu)) {                              // nop
-                if (mode >= 2) patch_u32(pand, old_and);
-                return false;
-            }
-            *at_tbz = tbz;
-            *at_and = (mode >= 2) ? pand : 0;
-            return true;
-        }
-    }
+typedef void *(*GetInst_t)(void *mi);
+static GetInst_t g_getinst = nullptr;
+static void *g_getinst_mi = nullptr;
+
+typedef bool (*GetHeroUnlock_t)(int hero, void *mi);
+static GetHeroUnlock_t g_gethero_orig;
+typedef bool (*GetSkinUnlock_t)(int hero, int skin, void *mi);
+static GetSkinUnlock_t g_getskin_orig;
+typedef bool (*NewGetSkillUnlock_t)(int hero, int skill, void *mi);
+static NewGetSkillUnlock_t g_newgetskill_orig;
+typedef bool (*ContainsSkin_t)(int hero, int skin, void *mi);
+static ContainsSkin_t g_containsskin = nullptr;
+static void *g_containsskin_mi = nullptr;
+
+static uintptr_t g_acc_hero = 0, g_acc_skin = 0, g_acc_skill = 0;
+
+struct SiteSet { uintptr_t ra[64]; int n; };
+static SiteSet g_sites_hero, g_sites_skin, g_sites_skill;
+
+static bool in_sites(const SiteSet &s, uintptr_t ra) {
+    for (int i = 0; i < s.n; i++) if (s.ra[i] == ra) return true;
     return false;
+}
+
+static const PriceName k_allowed[] = {
+    {"ChooseHeroModel", "OnShow"},
+    {"ChooseHeroModel", "MakeSuperHeroDataList"},
+    {"ChooseHeroModel", "MakeSkinDataList"},
+    {"ChooseHeroModel", "RefreshCurrentHeroSkinSkillData"},
+    {"ChooseHeroModel", "DoHeroConfirmButtonState"},
+    {"ChooseHeroModel", "OnConfirmButtonClicked"},
+    {"RGSaveManager",   "GetCurrentSkin"},
+    {"RGController",    "AwakeController"},
+};
+
+// true when RGSaveManager.char_list has a non-null entry for this hero id
+static char *hero_entry(int hero) {
+    if (hero < 0 || !g_getinst) return nullptr;
+    char *inst = (char *) g_getinst(g_getinst_mi);
+    if (!inst) return nullptr;
+    char *arr = *(char **) (inst + g_off_charlist);
+    if (!arr) return nullptr;
+    int n = *(int *) (arr + 0x18);
+    if (n <= 0 || n > 4096 || hero >= n) return nullptr;
+    return *(char **) (arr + 0x20 + (size_t) hero * 8);
+}
+
+static bool hero_entry_exists(int hero) { return hero_entry(hero) != nullptr; }
+
+// Skin save values -3 and -8: MakeSkinDataList skips a locked skin with one of
+// these values (the cell is never shown). They stay game-controlled.
+static const int SKIN_HIDDEN_A = -3;
+static const int SKIN_HIDDEN_B = -8;
+
+// reads char_list[hero].skin_list[skin]; false if anything is missing/out of range
+static bool skin_value(int hero, int skin, int *out) {
+    if (skin < 0) return false;
+    char *entry = hero_entry(hero);
+    if (!entry) return false;
+    char *sl = *(char **) (entry + g_off_skinlist);
+    if (!sl) return false;
+    int len = *(int *) (sl + 0x18);
+    if (len <= 0 || len > 4096 || skin >= len) return false;
+    *out = *(int *) (sl + 0x20 + (size_t) skin * 4);
+    return true;
+}
+
+__attribute__((noinline))
+static bool gethero_hook(int hero, void *mi) {
+    static int logged = 0;
+    uintptr_t ra = (uintptr_t) __builtin_return_address(0);
+    if (!in_sites(g_sites_hero, ra) || !hero_entry_exists(hero)) return g_gethero_orig(hero, mi);
+    if (logged < 20) {
+        logged++;
+        bool o = g_gethero_orig(hero, mi);
+        LOGI("unlockall: GetHeroUnlock(%d) orig=%d -> 1 (ra=%p)", hero, (int) o, (void *) ra);
+    }
+    return true;
+}
+
+__attribute__((noinline))
+static bool getskin_hook(int hero, int skin, void *mi) {
+    static int logged = 0, kept = 0;
+    uintptr_t ra = (uintptr_t) __builtin_return_address(0);
+    int v = 0;
+    if (in_sites(g_sites_skin, ra) && skin >= 0 && g_containsskin &&
+        g_containsskin(hero, skin, g_containsskin_mi) && skin_value(hero, skin, &v)) {
+        if (v == SKIN_HIDDEN_A || v == SKIN_HIDDEN_B) {
+            if (kept < 10) { kept++; LOGI("unlockskin: GetSkinUnlock(%d, %d) value=%d hidden skin, game answer kept", hero, skin, v); }
+            return g_getskin_orig(hero, skin, mi);
+        }
+        if (logged < 20) {
+            logged++;
+            bool o = g_getskin_orig(hero, skin, mi);
+            LOGI("unlockskin: GetSkinUnlock(%d, %d) value=%d orig=%d -> 1 (ra=%p)", hero, skin, v, (int) o, (void *) ra);
+        }
+        return true;
+    }
+    return g_getskin_orig(hero, skin, mi);
+}
+
+__attribute__((noinline))
+static bool newgetskill_hook(int hero, int skill, void *mi) {
+    static int logged = 0;
+    uintptr_t ra = (uintptr_t) __builtin_return_address(0);
+    if (in_sites(g_sites_skill, ra) && skill >= 0 && hero_entry_exists(hero)) {
+        if (logged < 20) {
+            logged++;
+            bool o = g_newgetskill_orig(hero, skill, mi);
+            LOGI("unlockskill: NewGetSkillUnlock(%d, %d) orig=%d -> 1 (ra=%p)", hero, skill, (int) o, (void *) ra);
+        }
+        return true;
+    }
+    return g_newgetskill_orig(hero, skill, mi);
 }
 
 // ---------------------------------------------------------
@@ -764,6 +872,7 @@ static int (*field_get_offset)(void *) = nullptr;
 static void *(*method_ret_type)(void *) = nullptr;
 static int (*type_get_type)(void *) = nullptr;
 static const int IL2CPP_TYPE_I4 = 0x08;
+static const int IL2CPP_TYPE_BOOLEAN = 0x02;
 
 // Look up an instance field offset by class + field name. Keeps `fallback`
 // (and logs an E line) if the class or field cannot be found.
@@ -800,6 +909,40 @@ static bool hook(void *img, const char *ns, const char *cls, const char *m, int 
 #else
     return false;
 #endif
+}
+
+static void add_site(SiteSet &s, uintptr_t ra, const char *what, const char *cls, const char *m, uintptr_t fn) {
+    if (s.n >= 64) return;
+    s.ra[s.n++] = ra;
+    LOGI("unlock: %s site in %s.%s +0x%x", what, cls, m, (unsigned) (ra - 4 - fn));
+}
+
+// Locate cls.m by iterating the class methods, then scan its code (up to the
+// next method of the class, at most 0x2000 bytes) for bl to the accessors.
+static void scan_sites(void *img, const char *cls, const char *m) {
+    void *k = find_class(img, cls);
+    if (!k || !class_get_methods || !method_get_name) { LOGE("unlock: %s.%s class/methods unavailable", cls, m); return; }
+    std::vector<uintptr_t> all, mine;
+    void *it = nullptr;
+    while (void *mi = class_get_methods(k, &it)) {
+        uintptr_t a = (uintptr_t) *(void **) mi;
+        if (!a) continue;
+        all.push_back(a);
+        if (!strcmp(method_get_name(mi), m)) mine.push_back(a);
+    }
+    if (mine.empty()) { LOGE("unlock: %s.%s not found", cls, m); return; }
+    for (uintptr_t fn : mine) {
+        uintptr_t hi = fn + 0x2000;
+        for (uintptr_t b : all) if (b > fn && b < hi) hi = b;
+        for (uintptr_t at = fn; at < hi; at += 4) {
+            uintptr_t t = bl_target(at);
+            if (!t) continue;
+            if (g_acc_hero  && t == g_acc_hero)  add_site(g_sites_hero,  at + 4, "hero",  cls, m, fn);
+            if (g_acc_skin  && t == g_acc_skin)  add_site(g_sites_skin,  at + 4, "skin",  cls, m, fn);
+            if (g_acc_skill && t == g_acc_skill) add_site(g_sites_skill, at + 4, "skill", cls, m, fn);
+        }
+        LOGI("unlock: scanned %s.%s range 0x%x", cls, m, (unsigned) (hi - fn));
+    }
 }
 
 static void install(void *h) {
@@ -874,56 +1017,45 @@ static void install(void *h) {
     if (on("goldarmor"))
         g_off_curcoin = resolve_off(image, "CoinChangeEvent", "curCoinVal", g_off_curcoin);
 
-    // --- lockedlevel: show the upgrade button for locked heroes (in-place patch, no hook) ---
-    // Stages (ds_hooks.txt "lockedlevel=N"; default 1 = known safe), for bisecting a UI break.
-    // Known so far: 0 normal, 1 normal, 2 (old numbering: class + method lookup) BREAKS.
-    //   1 = resolve ChooseHeroData.unlocked only
-    //   2 = + find_class(ChooseHeroView) only, no method lookup
-    //   3 = + method_by_name(RefreshUnlockArea) via class_get_methods iteration
-    //       (no method_by_name call, to tell the two lookups apart)
-    //   4 = same as 3 but via method_by_name
-    //   5 = + patch tbz only
-    //   6 = + patch the other-button check (full feature)
-    if (on("lockedlevel")) {
-        int st = stage("lockedlevel", 1);
-        LOGI("lockedlevel: stage %d", st);
-        int o = resolve_off(image, "ChooseHeroData", "unlocked", g_off_cd_unlocked + 0x10);
-        g_off_cd_unlocked = o >= 0x10 ? o - 0x10 : o;
-        LOGI("lockedlevel: stage 1 done (unlocked raw off 0x%x)", g_off_cd_unlocked);
-        void *kv = nullptr;
-        uintptr_t fn = 0;
-        if (st >= 2) {
-            kv = find_class(image, "ChooseHeroView");
-            LOGI("lockedlevel: stage 2 done, ChooseHeroView class=%p", kv);
-        }
-        if (st >= 3 && kv) {
-            if (st == 3) {
-                // iterate the method list instead of calling method_by_name
-                if (class_get_methods && method_get_name) {
-                    void *iter = nullptr;
-                    while (void *mi = class_get_methods(kv, &iter)) {
-                        if (strcmp(method_get_name(mi), "RefreshUnlockArea") == 0 && *(void **) mi) {
-                            fn = (uintptr_t) *(void **) mi;
-                            break;
-                        }
-                    }
-                } else LOGE("lockedlevel: class_get_methods API missing");
-            } else {
-                void *mi = method_by_name(kv, "RefreshUnlockArea", 1);
-                fn = mi ? (uintptr_t) *(void **) mi : 0;
-            }
-            if (fn) LOGI("lockedlevel: stage %d done, RefreshUnlockArea @%p", st >= 4 ? 4 : 3, (void *) fn);
-            else LOGE("lockedlevel: RefreshUnlockArea not found, skipped");
-        }
-        if (st >= 5 && fn) {
-            uintptr_t at_tbz = 0, at_and = 0;
-            if (patch_lockedlevel(fn, g_off_cd_unlocked, st >= 6 ? 2 : 1, &at_tbz, &at_and))
-                LOGI("lockedlevel: patched RefreshUnlockArea @%p: tbz->nop at +0x%x, and at +0x%x (0 = not patched), unlocked off 0x%x",
-                     (void *) fn, (unsigned) (at_tbz - fn), at_and ? (unsigned) (at_and - fn) : 0u, g_off_cd_unlocked);
-            else
-                LOGE("lockedlevel: RefreshUnlockArea @%p pattern not found / patch failed, skipped", (void *) fn);
+    // --- unlockall / unlockskin / unlockskill: accessors forced true at fixed call sites ---
+    if (on("unlockall") || on("unlockskill") || on("unlockskin")) {
+        g_off_charlist = resolve_off(image, "RGSaveManager", "char_list", g_off_charlist);
+        g_off_skinlist = resolve_off(image, "RGCharacterInfo", "skin_list", g_off_skinlist);
+        void *sk = find_class(image, "RGSaveManager");
+        void *gmi = sk ? method_by_name(sk, "get_Inst", 0) : nullptr;
+        if (gmi && *(void **) gmi) {
+            g_getinst = (GetInst_t) *(void **) gmi;
+            g_getinst_mi = gmi;
+            LOGI("unlock: RGSaveManager.get_Inst resolved @%p", (void *) g_getinst);
+        } else LOGE("unlock: RGSaveManager.get_Inst not found, hero/skin/skill unlock skipped");
+        if (g_getinst) {
+            if (on("unlockall"))   g_acc_hero  = method_addr(image, "DataUtil", "GetHeroUnlock", 1);
+            if (on("unlockskin"))  g_acc_skin  = method_addr(image, "DataUtil", "GetSkinUnlock", 2);
+            if (on("unlockskill")) g_acc_skill = method_addr(image, "DataUtil", "NewGetSkillUnlock", 2);
+            LOGI("unlock: accessors hero=%p skin=%p skill=%p", (void *) g_acc_hero, (void *) g_acc_skin, (void *) g_acc_skill);
+            for (const PriceName &a : k_allowed) scan_sites(image, a.cls, a.m);
+            LOGI("unlock: sites found hero=%d skin=%d skill=%d", g_sites_hero.n, g_sites_skin.n, g_sites_skill.n);
         }
     }
+    if (g_getinst && g_sites_hero.n > 0)
+        hook(image, "", "DataUtil", "GetHeroUnlock", 1,
+             (void *) gethero_hook, (void **) &g_gethero_orig, IL2CPP_TYPE_BOOLEAN);
+    else if (on("unlockall")) LOGE("unlockall: no call sites found, hook skipped");
+    if (g_getinst && g_sites_skin.n > 0) {
+        void *dk = find_class(image, "DataUtil");
+        void *cmi = dk ? method_by_name(dk, "ContainsSkin", 2) : nullptr;
+        if (cmi && *(void **) cmi) {
+            g_containsskin = (ContainsSkin_t) *(void **) cmi;
+            g_containsskin_mi = cmi;
+            LOGI("unlockskin: DataUtil.ContainsSkin resolved @%p", (void *) g_containsskin);
+            hook(image, "", "DataUtil", "GetSkinUnlock", 2,
+                 (void *) getskin_hook, (void **) &g_getskin_orig, IL2CPP_TYPE_BOOLEAN);
+        } else LOGE("unlockskin: DataUtil.ContainsSkin not found, skins skipped");
+    } else if (on("unlockskin")) LOGE("unlockskin: no call sites found, hook skipped");
+    if (g_getinst && g_sites_skill.n > 0)
+        hook(image, "", "DataUtil", "NewGetSkillUnlock", 2,
+             (void *) newgetskill_hook, (void **) &g_newgetskill_orig, IL2CPP_TYPE_BOOLEAN);
+    else if (on("unlockskill")) LOGE("unlockskill: no call sites found, hook skipped");
 
     // --- hp: HurtHp (base + subclass overrides, deduped by address) ---
     if (on("hp")) {
