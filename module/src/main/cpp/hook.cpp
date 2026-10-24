@@ -24,8 +24,8 @@ extern "C" void A64HookFunction(void *symbol, void *replace, void **result);
 //                  Missing file or unlisted name = enabled.
 //   sk_cd.txt    : cooldown factor 0.0 - 1.0 (re-read every second).
 //   Names: hp shield delaydead mall gem energy cooldown items dizzy
-//          seasoncoin autoattack crit shop goldarmor saleday unlockall
-//          unlockskin unlockskill
+//          seasoncoin autoattack crit shop goldarmor
+//          unlocksave
 // ---------------------------------------------------------
 #define CFG_DIR "/storage/emulated/0/Android/data/com.ChillyRoom.DungeonShooter/files/"
 
@@ -543,208 +543,116 @@ static int getmaxarmor_hook(void *self, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 14. Unlock heroes, skins, skills (unlockall, unlockskin, unlockskill)
+// 14. Unlock heroes, skins, skills by the game's own setters (unlocksave)
+//   Once per launch, right before the first ChooseHeroModel.OnShow, the game's
+//   DataUtil.SetHeroUnlock / SetSkinUnlock / SetSkillUnlock are called for every
+//   hero, skin and skill, then RGSaveManager.SaveGameData(). The unlocks then
+//   live in the save like bought ones; no accessor is hooked any more.
+//   While that bulk call runs, g_bulk silences the two telemetry calls
+//   (CommonStatistics.ReportClickUnlock, YearReviewManager.RecordDataIncrementInt)
+//   and MapManagerHall's HeroUnlockEvent handler (it can start guides).
 // ---------------------------------------------------------
-static int g_off_charlist = 0x20;
-static int g_off_skinlist = 0x28;
+static int g_off_charlist   = 0x20;
+static int g_off_skinlist   = 0x28;
+static int g_off_skillcount = 0x24;
+
+static const int SKIN_HIDDEN_A = -3;
+static const int SKIN_HIDDEN_B = -8;
 
 typedef void *(*GetInst_t)(void *mi);
 static GetInst_t g_getinst = nullptr;
 static void *g_getinst_mi = nullptr;
 
-typedef bool (*GetHeroUnlock_t)(int hero, void *mi);
-static GetHeroUnlock_t g_gethero_orig;
-typedef bool (*GetSkinUnlock_t)(int hero, int skin, void *mi);
-static GetSkinUnlock_t g_getskin_orig;
-typedef bool (*NewGetSkillUnlock_t)(int hero, int skill, void *mi);
-static NewGetSkillUnlock_t g_newgetskill_orig;
-typedef bool (*ContainsSkin_t)(int hero, int skin, void *mi);
-static ContainsSkin_t g_containsskin = nullptr;
-static void *g_containsskin_mi = nullptr;
+typedef void (*SaveGameData_t)(void *self, void *mi);
+static SaveGameData_t g_savegame = nullptr;
+static void *g_savegame_mi = nullptr;
 
-static uintptr_t g_acc_hero = 0, g_acc_skin = 0, g_acc_skill = 0;
+typedef void (*SetHeroUnlock_t)(int hero, bool unlock, void *mi);
+typedef void (*SetSkinUnlock_t)(int hero, int skin, bool unlock, bool needTrack, void *mi);
+typedef void (*SetSkillUnlock_t)(int hero, int skill, bool unlock, bool ignoreTrack, void *mi);
+static SetHeroUnlock_t  g_sethero  = nullptr;  static void *g_sethero_mi  = nullptr;
+static SetSkinUnlock_t  g_setskin  = nullptr;  static void *g_setskin_mi  = nullptr;
+static SetSkillUnlock_t g_setskill = nullptr;  static void *g_setskill_mi = nullptr;
 
-struct SiteSet { uintptr_t ra[64]; int hits[64]; int n; };
-static SiteSet g_sites_hero, g_sites_skin, g_sites_skill;
-
-static int site_idx(const SiteSet &s, uintptr_t ra) {
-    for (int i = 0; i < s.n; i++) if (s.ra[i] == ra) return i;
-    return -1;
-}
-
-static bool site_log(SiteSet &s, int i) {
-    if (i < 0 || s.hits[i] >= 3) return false;
-    s.hits[i]++;
-    return true;
-}
-
-static const PriceName k_allowed[] = {
-    {"ChooseHeroModel", "OnShow"},
-    {"ChooseHeroModel", "MakeSuperHeroDataList"},
-    {"ChooseHeroModel", "MakeSkinDataList"},
-    {"ChooseHeroModel", "RefreshCurrentHeroSkinSkillData"},
-    {"ChooseHeroModel", "DoHeroConfirmButtonState"},
-    {"ChooseHeroModel", "OnConfirmButtonClicked"},
-    {"RGSaveManager",   "GetCurrentSkin"},
-    {"RGController",    "AwakeController"},
+static volatile bool g_bulk = false;
+struct BulkGuard {
+    BulkGuard() { g_bulk = true; }
+    ~BulkGuard() { g_bulk = false; }
 };
 
-static char *hero_entry(int hero) {
-    if (hero < 0 || !g_getinst) return nullptr;
-    char *inst = (char *) g_getinst(g_getinst_mi);
-    if (!inst) return nullptr;
-    char *arr = *(char **) (inst + g_off_charlist);
-    if (!arr) return nullptr;
-    int n = *(int *) (arr + 0x18);
-    if (n <= 0 || n > 4096 || hero >= n) return nullptr;
-    return *(char **) (arr + 0x20 + (size_t) hero * 8);
+typedef void (*HallHeroEv_t)(void *self, void *ev, void *mi);
+static HallHeroEv_t g_hallhero_orig;
+static void hallhero_hook(void *self, void *ev, void *mi) {
+    if (g_bulk) return;
+    g_hallhero_orig(self, ev, mi);
 }
 
-static bool hero_entry_exists(int hero) { return hero_entry(hero) != nullptr; }
-
-static const int SKIN_HIDDEN_A = -3;
-static const int SKIN_HIDDEN_B = -8;
-
-static bool skin_value(int hero, int skin, int *out) {
-    if (skin < 0) return false;
-    char *entry = hero_entry(hero);
-    if (!entry) return false;
-    char *sl = *(char **) (entry + g_off_skinlist);
-    if (!sl) return false;
-    int len = *(int *) (sl + 0x18);
-    if (len <= 0 || len > 4096 || skin >= len) return false;
-    *out = *(int *) (sl + 0x20 + (size_t) skin * 4);
-    return true;
+typedef void (*ReportUnlock_t)(int a, int b, int c, int d, int e, void *mi);
+static ReportUnlock_t g_reportunlock_orig;
+static void reportunlock_hook(int a, int b, int c, int d, int e, void *mi) {
+    if (g_bulk) return;
+    g_reportunlock_orig(a, b, c, d, e, mi);
 }
 
-__attribute__((noinline))
-static bool gethero_hook(int hero, void *mi) {
-    uintptr_t ra = (uintptr_t) __builtin_return_address(0);
-    int si = site_idx(g_sites_hero, ra);
-    if (si < 0 || !hero_entry_exists(hero)) return g_gethero_orig(hero, mi);
-    if (site_log(g_sites_hero, si)) {
-        bool o = g_gethero_orig(hero, mi);
-        LOGI("unlockall: GetHeroUnlock(%d) orig=%d -> 1 (site %d, ra=%p)", hero, (int) o, si, (void *) ra);
-    }
-    return true;
+typedef void (*RecordInc_t)(void *name, int count, void *mi);
+static RecordInc_t g_recordinc_orig;
+static void recordinc_hook(void *name, int count, void *mi) {
+    if (g_bulk) return;
+    g_recordinc_orig(name, count, mi);
 }
 
-__attribute__((noinline))
-static bool getskin_hook(int hero, int skin, void *mi) {
-    uintptr_t ra = (uintptr_t) __builtin_return_address(0);
-    int si = site_idx(g_sites_skin, ra);
-    if (si >= 0 && skin >= 0 && g_containsskin) {
-        bool has = g_containsskin(hero, skin, g_containsskin_mi);
-        int v = 0;
-        bool ok = has && skin_value(hero, skin, &v);
-        if (ok && v != SKIN_HIDDEN_A && v != SKIN_HIDDEN_B) {
-            if (site_log(g_sites_skin, si)) {
-                bool o = g_getskin_orig(hero, skin, mi);
-                LOGI("unlockskin: GetSkinUnlock(%d, %d) value=%d orig=%d -> 1 (site %d, ra=%p)", hero, skin, v, (int) o, si, (void *) ra);
+static bool g_unlock_done = false;
+static bool g_unlock_running = false;
+
+static void do_unlock_all() {
+    if (g_unlock_done || g_unlock_running) return;
+    char *inst = g_getinst ? (char *) g_getinst(g_getinst_mi) : nullptr;
+    char *arr = inst ? *(char **) (inst + g_off_charlist) : nullptr;
+    int n = arr ? *(int *) (arr + 0x18) : 0;
+    if (n <= 0 || n > 4096) return;   // save not loaded yet: retry on the next OnShow
+    g_unlock_running = true;
+    g_unlock_done = true;
+    int nh = 0, ns = 0, nk = 0;
+    {
+        BulkGuard guard;
+        for (int h = 0; h < n; h++) {
+            char *e = *(char **) (arr + 0x20 + (size_t) h * 8);
+            if (!e) continue;
+            g_sethero(h, true, g_sethero_mi);
+            nh++;
+            char *sl = *(char **) (e + g_off_skinlist);
+            int len = sl ? *(int *) (sl + 0x18) : 0;
+            if (len > 0 && len <= 4096) {
+                for (int k = 0; k < len; k++) {
+                    int v = *(int *) (sl + 0x20 + (size_t) k * 4);
+                    if (v == SKIN_HIDDEN_A || v == SKIN_HIDDEN_B) continue;
+                    g_setskin(h, k, true, false, g_setskin_mi);
+                    ns++;
+                }
             }
-            return true;
-        }
-        if (site_log(g_sites_skin, si))
-            LOGI("unlockskin: GetSkinUnlock(%d, %d) game answer kept (contains=%d value-ok=%d value=%d, site %d)", hero, skin, (int) has, (int) ok, v, si);
-    }
-    return g_getskin_orig(hero, skin, mi);
-}
-
-__attribute__((noinline))
-static bool newgetskill_hook(int hero, int skill, void *mi) {
-    uintptr_t ra = (uintptr_t) __builtin_return_address(0);
-    int si = site_idx(g_sites_skill, ra);
-    if (si >= 0 && skill >= 0 && hero_entry_exists(hero)) {
-        if (site_log(g_sites_skill, si)) {
-            bool o = g_newgetskill_orig(hero, skill, mi);
-            LOGI("unlockskill: NewGetSkillUnlock(%d, %d) orig=%d -> 1 (site %d, ra=%p)", hero, skill, (int) o, si, (void *) ra);
-        }
-        return true;
-    }
-    return g_newgetskill_orig(hero, skill, mi);
-}
-
-static int g_off_modeldata = 0x28;
-static int g_cd_id    = 0x00;
-static int g_cd_unl   = 0x04;
-static int g_cd_state = 0x98;
-static int g_conf_mask = 0;
-typedef void (*DoHeroConfirm_t)(void *self, void *mi);
-static DoHeroConfirm_t g_doheroconfirm_orig;
-
-static void doheroconfirm_hook(void *self, void *mi) {
-    static int logged = 0, changed = 0;
-    g_doheroconfirm_orig(self, mi);
-    if (!self || !g_conf_mask) return;
-    char *d = (char *) self + g_off_modeldata;
-    int hero = *(int *) (d + g_cd_id);
-    bool unl = *(volatile unsigned char *) (d + g_cd_unl) != 0;
-    int *ps = (int *) (d + g_cd_state);
-    int s = *ps;
-    if (logged < 12) { logged++; LOGI("unlock: confirm state hero=%d unlocked=%d state=0x%x", hero, (int) unl, s); }
-    if (s != 1 && unl && (s & ~g_conf_mask) == 0 && hero_entry_exists(hero)) {
-        *ps = 1;
-        if (changed < 12) { changed++; LOGI("unlock: confirm state hero=%d 0x%x -> 1", hero, s); }
-    }
-}
-
-// ---------------------------------------------------------
-// 15. Sales Day challenge always active, produced only from the map/room
-//     builders.
-//     BattleData.get_IsSaleDay is
-//         if (get_IsNormalMode()) return CompareFactor(316); else false
-//     Its seven callers (scan_issaleday.txt):
-//         BattleDataWrap._g_get_IsSaleDay              (Lua bridge, read-only)
-//         ActivitySchoolMapStructureGenerationStrategy.CreateMapStructure
-//         DefaultMapStructureGenerationStrategy.CreateMapStructure
-//         MapManagerLevel.InstantiateChestRoom
-//         MapManagerLevel.InstantiateSpecialRoom
-//         UIShowCurrencyGroupDesc.GetHeroRoomDefault   (UI text)
-//         BattleData.GetSpecialRoomCount
-//     Only the five gameplay builders in that list need to see Sales Day as
-//     active. The Lua bridge and the UI text get the game's answer, and
-//     nothing else in the game (daily-challenge picker, tally) can see a
-//     forced value, because the old global CompareFactor hook is gone. The
-//     previous design answered CompareFactor(316)=true for every caller,
-//     which let the daily-challenge slot picker believe Sales Day already
-//     occupied a slot. That is what swallowed a challenge; that hook is
-//     removed here.
-//
-//     Sites are found at install by iterating class_get_methods on each of
-//     the five builders and scanning up to the next method of the class
-//     (cap 0x2000) for a bl to get_IsSaleDay's runtime address. No dump.cs
-//     RVA is used, so the same mechanism that keeps the unlock hooks alive
-//     across updates keeps this one.
-// ---------------------------------------------------------
-typedef bool (*IsSaleDay_t)(void *mi);
-static IsSaleDay_t g_issaleday_orig = nullptr;
-
-struct SdSiteSet { uintptr_t ra[16]; int hits[16]; int n; };
-static SdSiteSet g_sd_sites;
-
-__attribute__((noinline))
-static bool issaleday_hook(void *mi) {
-    static int logged_global = 0;
-    bool orig = g_issaleday_orig ? g_issaleday_orig(mi) : false;
-    if (orig) return true;
-    uintptr_t ra = (uintptr_t) __builtin_return_address(0);
-    for (int i = 0; i < g_sd_sites.n; i++) {
-        if (ra == g_sd_sites.ra[i]) {
-            if (g_sd_sites.hits[i] < 3) {
-                g_sd_sites.hits[i]++;
-                LOGI("saleday: IsSaleDay true at site %d (ra=%p)", i, (void *) ra);
-            } else if (logged_global < 1) {
-                logged_global++;
-                LOGI("saleday: further site hits suppressed");
+            int sc = *(int *) (e + g_off_skillcount);
+            if (sc > 0 && sc <= 64) {
+                for (int k = 0; k < sc; k++) {
+                    g_setskill(h, k, true, true, g_setskill_mi);
+                    nk++;
+                }
             }
-            return true;
         }
     }
-    return orig;
+    if (g_savegame) g_savegame(inst, g_savegame_mi);
+    LOGI("unlocksave: heroes=%d skins=%d skills=%d saved=%d", nh, ns, nk, (int) (g_savegame != nullptr));
+    g_unlock_running = false;
+}
+
+typedef void (*OnShow_t)(void *self, void *extra, void *mi);
+static OnShow_t g_onshow_orig;
+static void onshow_hook(void *self, void *extra, void *mi) {
+    do_unlock_all();
+    g_onshow_orig(self, extra, mi);
 }
 
 // ---------------------------------------------------------
-// 16. Installer
+// 15. Installer
 // ---------------------------------------------------------
 typedef void *(*ClassFromName_t)(void *, const char *, const char *);
 typedef void *(*MethodByName_t)(void *, const char *, int);
@@ -852,68 +760,6 @@ static bool hook(void *img, const char *ns, const char *cls, const char *m, int 
 #endif
 }
 
-static void add_site(SiteSet &s, uintptr_t ra, const char *what, const char *cls, const char *m, uintptr_t fn) {
-    if (s.n >= 64) return;
-    s.ra[s.n++] = ra;
-    LOGI("unlock: %s site in %s.%s +0x%x", what, cls, m, (unsigned) (ra - 4 - fn));
-}
-
-static void scan_sites(void *img, const char *cls, const char *m) {
-    void *k = find_class(img, cls);
-    if (!k || !class_get_methods || !method_get_name) { LOGE("unlock: %s.%s class/methods unavailable", cls, m); return; }
-    std::vector<uintptr_t> all, mine;
-    void *it = nullptr;
-    while (void *mi = class_get_methods(k, &it)) {
-        uintptr_t a = (uintptr_t) *(void **) mi;
-        if (!a) continue;
-        all.push_back(a);
-        if (!strcmp(method_get_name(mi), m)) mine.push_back(a);
-    }
-    if (mine.empty()) { LOGE("unlock: %s.%s not found", cls, m); return; }
-    for (uintptr_t fn : mine) {
-        uintptr_t hi = fn + 0x2000;
-        for (uintptr_t b : all) if (b > fn && b < hi) hi = b;
-        for (uintptr_t at = fn; at < hi; at += 4) {
-            uintptr_t t = bl_target(at);
-            if (!t) continue;
-            if (g_acc_hero  && t == g_acc_hero)  add_site(g_sites_hero,  at + 4, "hero",  cls, m, fn);
-            if (g_acc_skin  && t == g_acc_skin)  add_site(g_sites_skin,  at + 4, "skin",  cls, m, fn);
-            if (g_acc_skill && t == g_acc_skill) add_site(g_sites_skill, at + 4, "skill", cls, m, fn);
-        }
-        LOGI("unlock: scanned %s.%s range 0x%x", cls, m, (unsigned) (hi - fn));
-    }
-}
-
-// Locate cls.m by iterating class_get_methods and scan its body (up to the
-// next method of the class, cap 0x2000) for a bl to the accessor `target`.
-// Records the return address of each hit into `g_sd_sites`.
-static void scan_sd_sites(void *img, const char *cls, const char *m, uintptr_t target) {
-    void *k = find_class(img, cls);
-    if (!k || !class_get_methods || !method_get_name) { LOGE("saleday: %s.%s class/methods unavailable", cls, m); return; }
-    std::vector<uintptr_t> all, mine;
-    void *it = nullptr;
-    while (void *mi = class_get_methods(k, &it)) {
-        uintptr_t a = (uintptr_t) *(void **) mi;
-        if (!a) continue;
-        all.push_back(a);
-        if (!strcmp(method_get_name(mi), m)) mine.push_back(a);
-    }
-    if (mine.empty()) { LOGE("saleday: %s.%s not found", cls, m); return; }
-    for (uintptr_t fn : mine) {
-        uintptr_t hi = fn + 0x2000;
-        for (uintptr_t b : all) if (b > fn && b < hi) hi = b;
-        for (uintptr_t at = fn; at < hi; at += 4) {
-            uintptr_t t = bl_target(at);
-            if (t != target) continue;
-            if (g_sd_sites.n >= 16) break;
-            g_sd_sites.ra[g_sd_sites.n] = at + 4;
-            LOGI("saleday: site in %s.%s +0x%x", cls, m, (unsigned) (at - fn));
-            g_sd_sites.n++;
-        }
-        LOGI("saleday: scanned %s.%s range 0x%x", cls, m, (unsigned) (hi - fn));
-    }
-}
-
 static uintptr_t iter_method_addr(void *img, const char *cls, const char *m) {
     void *k = find_class(img, cls);
     if (!k || !class_get_methods || !method_get_name) return 0;
@@ -994,57 +840,46 @@ static void install(void *h) {
     if (on("goldarmor"))
         g_off_curcoin = resolve_off(image, "CoinChangeEvent", "curCoinVal", g_off_curcoin);
 
-    if (on("unlockall") || on("unlockskill") || on("unlockskin")) {
-        g_off_charlist = resolve_off(image, "RGSaveManager", "char_list", g_off_charlist);
-        g_off_skinlist = resolve_off(image, "RGCharacterInfo", "skin_list", g_off_skinlist);
-        g_off_modeldata = resolve_off(image, "ChooseHeroModel", "data", g_off_modeldata);
-        g_cd_id    = resolve_off(image, "ChooseHeroData", "id", g_cd_id + 0x10) - 0x10;
-        g_cd_unl   = resolve_off(image, "ChooseHeroData", "unlocked", g_cd_unl + 0x10) - 0x10;
-        g_cd_state = resolve_off(image, "ChooseHeroData", "confirmButtonState", g_cd_state + 0x10) - 0x10;
+    if (on("unlocksave")) {
+        g_off_charlist   = resolve_off(image, "RGSaveManager", "char_list", g_off_charlist);
+        g_off_skinlist   = resolve_off(image, "RGCharacterInfo", "skin_list", g_off_skinlist);
+        g_off_skillcount = resolve_off(image, "RGCharacterInfo", "skillCount", g_off_skillcount);
         void *sk = find_class(image, "RGSaveManager");
         void *gmi = sk ? method_by_name(sk, "get_Inst", 0) : nullptr;
-        if (gmi && *(void **) gmi) {
-            g_getinst = (GetInst_t) *(void **) gmi;
-            g_getinst_mi = gmi;
-            LOGI("unlock: RGSaveManager.get_Inst resolved @%p", (void *) g_getinst);
-        } else LOGE("unlock: RGSaveManager.get_Inst not found, hero/skin/skill unlock skipped");
-        if (g_getinst) {
-            if (on("unlockall"))   g_acc_hero  = method_addr(image, "DataUtil", "GetHeroUnlock", 1);
-            if (on("unlockskin"))  g_acc_skin  = method_addr(image, "DataUtil", "GetSkinUnlock", 2);
-            if (on("unlockskill")) g_acc_skill = method_addr(image, "DataUtil", "NewGetSkillUnlock", 2);
-            LOGI("unlock: accessors hero=%p skin=%p skill=%p", (void *) g_acc_hero, (void *) g_acc_skin, (void *) g_acc_skill);
-            for (const PriceName &a : k_allowed) scan_sites(image, a.cls, a.m);
-            LOGI("unlock: sites found hero=%d skin=%d skill=%d", g_sites_hero.n, g_sites_skin.n, g_sites_skill.n);
-        }
-    }
-    if (g_getinst && g_sites_hero.n > 0)
-        hook(image, "", "DataUtil", "GetHeroUnlock", 1,
-             (void *) gethero_hook, (void **) &g_gethero_orig, IL2CPP_TYPE_BOOLEAN);
-    else if (on("unlockall")) LOGE("unlockall: no call sites found, hook skipped");
-    if (g_getinst && g_sites_skin.n > 0) {
+        void *smi = sk ? method_by_name(sk, "SaveGameData", 0) : nullptr;
         void *dk = find_class(image, "DataUtil");
-        void *cmi = dk ? method_by_name(dk, "ContainsSkin", 2) : nullptr;
-        if (cmi && *(void **) cmi) {
-            g_containsskin = (ContainsSkin_t) *(void **) cmi;
-            g_containsskin_mi = cmi;
-            LOGI("unlockskin: DataUtil.ContainsSkin resolved @%p", (void *) g_containsskin);
-            hook(image, "", "DataUtil", "GetSkinUnlock", 2,
-                 (void *) getskin_hook, (void **) &g_getskin_orig, IL2CPP_TYPE_BOOLEAN);
-        } else LOGE("unlockskin: DataUtil.ContainsSkin not found, skins skipped");
-    } else if (on("unlockskin")) LOGE("unlockskin: no call sites found, hook skipped");
-    if (g_getinst && g_sites_skill.n > 0)
-        hook(image, "", "DataUtil", "NewGetSkillUnlock", 2,
-             (void *) newgetskill_hook, (void **) &g_newgetskill_orig, IL2CPP_TYPE_BOOLEAN);
-    else if (on("unlockskill")) LOGE("unlockskill: no call sites found, hook skipped");
-    g_conf_mask = (on("unlockskin") ? 0x10 : 0) | (on("unlockskill") ? 0x8 : 0);
-    if (g_getinst && g_conf_mask) {
-        uintptr_t ca = iter_method_addr(image, "ChooseHeroModel", "DoHeroConfirmButtonState");
+        void *hmi = dk ? method_by_name(dk, "SetHeroUnlock", 2) : nullptr;
+        void *kmi = dk ? method_by_name(dk, "SetSkinUnlock", 4) : nullptr;
+        void *lmi = dk ? method_by_name(dk, "SetSkillUnlock", 4) : nullptr;
+        if (gmi && *(void **) gmi) { g_getinst = (GetInst_t) *(void **) gmi; g_getinst_mi = gmi; }
+        if (smi && *(void **) smi) { g_savegame = (SaveGameData_t) *(void **) smi; g_savegame_mi = smi; }
+        if (hmi && *(void **) hmi) { g_sethero  = (SetHeroUnlock_t)  *(void **) hmi; g_sethero_mi  = hmi; }
+        if (kmi && *(void **) kmi) { g_setskin  = (SetSkinUnlock_t)  *(void **) kmi; g_setskin_mi  = kmi; }
+        if (lmi && *(void **) lmi) { g_setskill = (SetSkillUnlock_t) *(void **) lmi; g_setskill_mi = lmi; }
+        LOGI("unlocksave: get_Inst=%p SaveGameData=%p SetHero=%p SetSkin=%p SetSkill=%p",
+             (void *) g_getinst, (void *) g_savegame, (void *) g_sethero, (void *) g_setskin, (void *) g_setskill);
+        if (!g_getinst || !g_sethero || !g_setskin || !g_setskill) {
+            LOGE("unlocksave: a required function is missing, skipped");
+        } else {
+            bool t1 = hook(image, "", "CommonStatistics", "ReportClickUnlock", 5,
+                           (void *) reportunlock_hook, (void **) &g_reportunlock_orig);
+            bool t2 = hook(image, "", "YearReviewManager", "RecordDataIncrementInt", 2,
+                           (void *) recordinc_hook, (void **) &g_recordinc_orig);
+            bool t3 = hook(image, "", "MapManagerHall", "OnHeroUnlockEvent", 1,
+                           (void *) hallhero_hook, (void **) &g_hallhero_orig);
+            if (!t3) LOGE("unlocksave: hall handler hook missing, guides may appear after the first unlock");
+            uintptr_t os = iter_method_addr(image, "ChooseHeroModel", "OnShow");
+            if (!t1 || !t2) {
+                LOGE("unlocksave: telemetry hooks missing, skipped (nothing was unlocked)");
+            } else if (!os) {
+                LOGE("unlocksave: ChooseHeroModel.OnShow not found, skipped");
+            } else {
 #if defined(__aarch64__)
-        if (ca) {
-            A64HookFunction((void *) ca, (void *) doheroconfirm_hook, (void **) &g_doheroconfirm_orig);
-            LOGI("unlock: confirm-state hook installed @%p mask=0x%x model.data=0x%x state=0x%x", (void *) ca, g_conf_mask, g_off_modeldata, g_cd_state);
-        } else LOGE("unlock: ChooseHeroModel.DoHeroConfirmButtonState not found, Start state not adjusted");
+                A64HookFunction((void *) os, (void *) onshow_hook, (void **) &g_onshow_orig);
+                LOGI("unlocksave: OnShow hook installed @%p", (void *) os);
 #endif
+            }
+        }
     }
 
     if (on("hp")) {
@@ -1193,31 +1028,6 @@ static void install(void *h) {
              (void *) getmaxhp_hook, (void **) &g_getmaxhp_orig, IL2CPP_TYPE_I4);
         hook(image, "", "RoleAttributeProxy", "get_MaxArmor", 0,
              (void *) getmaxarmor_hook, (void **) &g_getmaxarmor_orig, IL2CPP_TYPE_I4);
-    }
-
-    // --- saleday: Sales Day challenge (effect only, at map/room builders) ---
-    if (on("saleday")) {
-        void *bk = find_class(image, "BattleData");
-        void *smi = bk ? method_by_name(bk, "get_IsSaleDay", 0) : nullptr;
-        if (!smi || !*(void **) smi) {
-            LOGE("saleday: BattleData.get_IsSaleDay not found, skipped");
-        } else {
-            uintptr_t target = (uintptr_t) *(void **) smi;
-            g_issaleday_orig = (IsSaleDay_t) *(void **) smi;
-            LOGI("saleday: get_IsSaleDay @%p", (void *) target);
-            scan_sd_sites(image, "DefaultMapStructureGenerationStrategy", "CreateMapStructure", target);
-            scan_sd_sites(image, "ActivitySchoolMapStructureGenerationStrategy", "CreateMapStructure", target);
-            scan_sd_sites(image, "MapManagerLevel", "InstantiateChestRoom", target);
-            scan_sd_sites(image, "MapManagerLevel", "InstantiateSpecialRoom", target);
-            scan_sd_sites(image, "BattleData", "GetSpecialRoomCount", target);
-            LOGI("saleday: sites found %d", g_sd_sites.n);
-            if (g_sd_sites.n > 0) {
-#if defined(__aarch64__)
-                A64HookFunction((void *) target, (void *) issaleday_hook, (void **) &g_issaleday_orig);
-                LOGI("saleday: hook installed @%p", (void *) target);
-#endif
-            } else LOGE("saleday: no call sites found, hook skipped");
-        }
     }
 }
 
