@@ -89,13 +89,6 @@ static void load_cfg() {
 
 static bool on(const char *k) { return g_off.find(k) == g_off.end(); }
 
-// Optional stage number for a group: "name=N" in ds_hooks.txt (0 = off as before).
-// Missing entry = def. Used to bisect which step of a group breaks something.
-static int stage(const char *k, int def) {
-    auto it = g_val.find(k);
-    return it == g_val.end() ? def : it->second;
-}
-
 static float get_cd_factor() {
     static float s_factor = 0.15f;
     static time_t s_last_check = 0;
@@ -152,11 +145,6 @@ static void *const g_repl[3] = {(void *) hurt_hook<0>, (void *) hurt_hook<1>, (v
 typedef bool (*Consume_t)(void *self, void *ev, void *mi);
 static Consume_t g_consume_orig;
 
-// The game keeps the real count in runtime data, keyed by _netId (@0x20).
-// SyncShieldCountFromRuntimeData reads it and overwrites _shieldCount (@0x18);
-// SaveShieldCount writes @0x18 into it. Restoring only the field gets undone
-// by the next sync, so after restoring we call SaveShieldCount to put the
-// restored count back into the runtime data.
 typedef void (*SaveShield_t)(void *self, void *mi);
 static SaveShield_t g_saveshield = nullptr;
 static int g_shield_off = 0x18;   // _shieldCount, resolved by name at install
@@ -186,8 +174,6 @@ static void adddead_hook(void *self, void *src, void *mi) {
 // ---------------------------------------------------------
 // 3. Mall Hooks (Free In-Game Purchases)
 // ---------------------------------------------------------
-// BuyItem returns MallPayResult. R16 passes back whatever the original returned
-// in x0/x1 (covers enum, reference and small struct), so the result is never lost.
 struct R16 { uint64_t a, b; };
 typedef R16 (*BuyItem_t)(void *self, void *mallItem, void *onDone, void *mi);
 static BuyItem_t g_buyitem_orig;
@@ -217,7 +203,6 @@ static bool hasenough_hook(void *mallItem, void *mi) {
 typedef bool (*ConsumeGem_t)(void *self, int amount, bool unk1, bool unk2, void *mi);
 static ConsumeGem_t g_consumegem_orig;
 
-// ConsumeGem returns Boolean (success); the caller checks it.
 static bool consumegem_hook(void *self, int amount, bool unk1, bool unk2, void *mi) {
     static int logged = 0;
     if (logged < 20) { logged++; LOGI("ConsumeGem intercepted! Original cost: %d -> Forcing 0", amount); }
@@ -227,8 +212,6 @@ static bool consumegem_hook(void *self, int amount, bool unk1, bool unk2, void *
 
 // ---------------------------------------------------------
 // 5. Energy Hook (RoleAttributePlayer.set_energy)
-//    Once energy drops to ENERGY_REFILL or below, set it back to max.
-//    No max bump: the game keeps its own limit anyway.
 // ---------------------------------------------------------
 static const int ENERGY_REFILL = 100;
 
@@ -253,9 +236,6 @@ static void setenergy_hook(void *self, int value, void *mi) {
 // ---------------------------------------------------------
 // 6. Skill Cooldown Hooks (SkillInfo)
 // ---------------------------------------------------------
-// get_FinalCooldown calls CalculateFinalCooldown inside (the log showed the
-// raw value of the first equal to the hooked result of the second), so scaling
-// both would apply the factor twice. A thread-local flag makes it apply once.
 static thread_local bool g_cd_applied = false;
 
 typedef float (*GetFinalCd_t)(void *self, void *mi);
@@ -288,7 +268,6 @@ static float calcfinalcd_hook(void *self, float cd, void *mi) {
 // ---------------------------------------------------------
 // 7. No Change: Materials, Seeds, Vouchers, Fish Chips (ItemData)
 // ---------------------------------------------------------
-// ConsumeMaterial has 4 overloads (string x2, Dictionary x2); all are blocked.
 static void consumemat_hook(void *self) {
     static int logged = 0;
     if (logged < 20) { logged++; LOGI("ConsumeMaterial blocked"); }
@@ -329,7 +308,6 @@ static float processplayerdizzy_hook(void *controller, float dizzyTime, void *bu
 
 // ---------------------------------------------------------
 // 9. Season Coin: No Deduct + Always Affordable
-//    WindowBuyOrWatchAdDialog (RGScript.UI)
 // ---------------------------------------------------------
 typedef void (*DoConsumeSeasonCoin_t)(void *self, void *mi);
 static DoConsumeSeasonCoin_t g_doconsumeseasoncoin_orig;
@@ -355,9 +333,6 @@ static bool isaffordable_hook(void *self, void *mi) {
 
 // ---------------------------------------------------------
 // 10. get_AutoAttack: true while in battle (RGWeapon)
-//     Outside battle, returns the game's own value so a real
-//     Fully Automatic Device still works.
-//     [0] get_AutoAttack (public)  [1] get__autoAttack (protected)
 // ---------------------------------------------------------
 typedef bool (*GetAutoAttack_t)(void *self, void *mi);
 static GetAutoAttack_t g_autoattack_orig[2];
@@ -397,11 +372,7 @@ static void m12setattack_hook(void *self, bool v, bool hand, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 11. Always Crit (not tied to the Precise Strike buff)
-//     DamageTrigger.HandleCritical is the roll. Trigger fields
-//     critical and camp are resolved by name (g_off_critical / g_off_camp).
-//     Camp.Character == 1.
-//     DealDamage is a fallback: forces isCrit for player-camp damage.
+// 11. Always Crit
 // ---------------------------------------------------------
 static const int CAMP_CHARACTER = 1;
 
@@ -439,20 +410,9 @@ static bool dealdamage_hook(void *carrier, int damage, bool isCrit, V3 repel, vo
 
 // ---------------------------------------------------------
 // 12. Free Shopping (not tied to the buff)
-//     Price code does: if (BattleData.HasBuff(ExpertShop=10))
-//         price = ceil(price * 0.5 * DataUtil.CalBuffExpertShopExtraRate(..)).
-//     1) CalBuffExpertShopExtraRate (called only from price code) returns 0.
-//     2) BattleData.HasBuff(10) returns true, but only when its caller sits
-//        inside one of the price functions, before their rate call. Every
-//        other HasBuff call anywhere in the game gets the real answer.
-//     Everything is resolved by class/method name at runtime (no RVAs), so
-//     it survives updates. A site is used only if a bl to the helper is
-//     found in its first 0x400 bytes; the found offsets are logged.
 // ---------------------------------------------------------
 static const int BUFF_EXPERTSHOP = 10;
 
-// Price functions, found by name. Each is scanned at install for its first bl
-// to the rate helper; HasBuff(10) is forced only for callers before that bl.
 struct PriceName { const char *cls; const char *m; };
 static const PriceName k_sites[] = {
     {"ItemSellerDoctor",       "GetItemValue"},
@@ -478,10 +438,6 @@ static uintptr_t bl_target(uintptr_t at) {
     return at + (intptr_t) imm * 4;
 }
 
-// Price code ends with  cmp Wn,#1 ; csinc Wd,Wn,wzr,gt  = max(1, price).
-// That clamp makes the cheapest possible price 1 (2 after the factor-106
-// doubling), so a rate of 0 alone is not free. The csinc is replaced by
-// mov Wd,Wn so 0 passes through.
 static bool patch_u32(uintptr_t at, uint32_t val) {
     uintptr_t pg = at & ~(uintptr_t) 4095;
     if (mprotect((void *) pg, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
@@ -495,12 +451,12 @@ static bool patch_clamp(uintptr_t rate_call, uintptr_t *where) {
     for (uintptr_t a = rate_call + 8; a < rate_call + 0x100; a += 4) {
         uint32_t ins  = *(volatile uint32_t *) a;
         uint32_t prev = *(volatile uint32_t *) (a - 4);
-        if ((ins & 0xFFFFFC00u) == 0x1A9FC400u &&            // csinc Wd, Wn, wzr, gt
-            (prev & 0xFFFFFC1Fu) == 0x7100041Fu &&           // cmp Wn, #1
+        if ((ins & 0xFFFFFC00u) == 0x1A9FC400u &&
+            (prev & 0xFFFFFC1Fu) == 0x7100041Fu &&
             ((prev >> 5) & 31) == ((ins >> 5) & 31)) {
             uint32_t rn = (ins >> 5) & 31, rd = ins & 31;
             *where = a;
-            return patch_u32(a, 0x2A0003E0u | (rn << 16) | rd);   // mov Wd, Wn
+            return patch_u32(a, 0x2A0003E0u | (rn << 16) | rd);
         }
     }
     return false;
@@ -535,13 +491,7 @@ static bool hasbuff_hook(void *self, int buff, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 13. Golden Armor+ (not tied to the buff)
-//     Every GOLD_STEP coins owned = +1 max HP and +1 max armor, no cap.
-//     Coin count is captured from CoinChangeEvent.curCoinVal (g_off_curcoin) in
-//     RoleAttributePlayer.OnCoinChange and from UpdateArmor(coinVal).
-//     The bonus is added in RoleAttributeProxy.get_max_hp / get_MaxArmor
-//     (the single source for 330 / 37 callers). Both must return Int32;
-//     the installer checks the return type before hooking.
+// 13. Golden Armor+
 // ---------------------------------------------------------
 static const int GOLD_STEP = 10;
 static volatile int g_coin = 0;
@@ -587,54 +537,16 @@ static int getmaxarmor_hook(void *self, void *mi) {
     static int logged = 0;
     int r = g_getmaxarmor_orig(self, mi);
     int b = gold_bonus();
-    if (r <= 0 || b <= 0) return r;   // characters without armor stay without
+    if (r <= 0 || b <= 0) return r;
     if (logged < 20) { logged++; LOGI("max_armor %d -> %d", r, r + b); }
     return r + b;
 }
 
 // ---------------------------------------------------------
 // 14. Unlock heroes, skins, skills (unlockall, unlockskin, unlockskill)
-//     Accessors, all static in DataUtil: GetHeroUnlock(hero),
-//     GetSkinUnlock(hero, skin), NewGetSkillUnlock(hero, skill).
-//     Caller scans of live code found 135 / 145 / 34 callers. Many of them
-//     write or grant something based on the answer (ProgressChecker quest
-//     counts, HonoraryTitle, RoomObjectManager achievements and AfterLoadSkins,
-//     RestoreRole, RGSaveManager.UpdateVersion, ItemUtility.AddItem, check-in
-//     ReplaceUnlockedReward, MallData.BuyItemPreCheck). A global "true" could
-//     therefore persist fake progress. So each hook answers true ONLY when its
-//     return address is one of the call sites found inside the methods listed
-//     in k_allowed; every other caller gets the game's own answer.
-//     The sites are found at install: each listed method is located by
-//     iterating class_get_methods (no method_by_name on ChooseHeroModel, see
-//     lessons), and its code up to the next method of the class is scanned for
-//     a bl to the accessor. Names only, no RVAs; found sites are logged.
-//     Evidence for the list (live disassembly):
-//     - ChooseHeroModel.OnShow, MakeSuperHeroDataList, MakeSkinDataList,
-//       RefreshCurrentHeroSkinSkillData fill ChooseHeroData (unlocked, skin
-//       cells, skillsUnlocked) or compare against it and set a refresh flag.
-//       The skin cell constructor stores the inverted GetSkinUnlock result as
-//       its "locked" byte (this+0x14).
-//     - ChooseHeroModel.DoHeroConfirmButtonState: button state only.
-//     - ChooseHeroModel.OnConfirmButtonClicked: resets the chosen skin to 0
-//       when the skin is neither unlocked nor trial.
-//     - RGSaveManager.GetCurrentSkin: returns the saved skin, or 0 when the
-//       skin is locked. No writes.
-//     - RGController.AwakeController: GetSkinUnlock gate at +0x6e0 that
-//       applies the chosen skin in game (the false path was not read; true
-//       takes the path of any owned skin).
-//     - ChooseHeroModel.GetSkillIndex is NOT listed (its use was not proven).
-//     - Start button: see doheroconfirm_hook below (state bits 0x10 / 0x8).
-//     Not proven statically: whether starting a run with a hero whose save
-//     entry says locked passes every later check in the game. If not, the
-//     visible effect is only that the run does not start; no save is written.
-//     Values: hero ids need a char_list entry; skins need DataUtil.ContainsSkin
-//     and a skin_list value other than -3 / -8 (MakeSkinDataList hides those
-//     skins when locked, they stay game-controlled); skills need a hero entry
-//     and skill >= 0 (every NewGetSkillUnlock caller was checked: no loop
-//     depends on the result; see lessons).
 // ---------------------------------------------------------
-static int g_off_charlist = 0x20;           // RGSaveManager.char_list, resolved by name
-static int g_off_skinlist = 0x28;           // RGCharacterInfo.skin_list, resolved by name
+static int g_off_charlist = 0x20;
+static int g_off_skinlist = 0x28;
 
 typedef void *(*GetInst_t)(void *mi);
 static GetInst_t g_getinst = nullptr;
@@ -660,7 +572,6 @@ static int site_idx(const SiteSet &s, uintptr_t ra) {
     return -1;
 }
 
-// Log the first 3 hits of every call site (not a global cap).
 static bool site_log(SiteSet &s, int i) {
     if (i < 0 || s.hits[i] >= 3) return false;
     s.hits[i]++;
@@ -678,7 +589,6 @@ static const PriceName k_allowed[] = {
     {"RGController",    "AwakeController"},
 };
 
-// true when RGSaveManager.char_list has a non-null entry for this hero id
 static char *hero_entry(int hero) {
     if (hero < 0 || !g_getinst) return nullptr;
     char *inst = (char *) g_getinst(g_getinst_mi);
@@ -692,12 +602,9 @@ static char *hero_entry(int hero) {
 
 static bool hero_entry_exists(int hero) { return hero_entry(hero) != nullptr; }
 
-// Skin save values -3 and -8: MakeSkinDataList skips a locked skin with one of
-// these values (the cell is never shown). They stay game-controlled.
 static const int SKIN_HIDDEN_A = -3;
 static const int SKIN_HIDDEN_B = -8;
 
-// reads char_list[hero].skin_list[skin]; false if anything is missing/out of range
 static bool skin_value(int hero, int skin, int *out) {
     if (skin < 0) return false;
     char *entry = hero_entry(hero);
@@ -757,19 +664,10 @@ static bool newgetskill_hook(int hero, int skill, void *mi) {
     return g_newgetskill_orig(hero, skill, mi);
 }
 
-// ChooseHeroModel.DoHeroConfirmButtonState builds the Start button state in
-// data.confirmButtonState (live disassembly): 1 = plain Start; flags 0x10 = skin
-// not unlocked (its GetSkinUnlock call), 0x8 = GetSkillUnlockedWithTrialed false,
-// 0x4 = hero locked and not trialed; 2 / 0x40 / 0x80 / 0x20 are ticket, trial and
-// ad states. ChooseHeroView.RefreshConfirmButton draws states 1, 2, 32, 64, 128
-// normally and every other value (0, 4, 8, 16, 9, 17, ...) greyed.
-// After the original runs, the state is set to 1 when the hero's data says
-// unlocked and the only bits set are ones our own groups answer for. All other
-// states (ticket, trial, ad) are left to the game.
-static int g_off_modeldata = 0x28;   // Model<T>.data inside ChooseHeroModel, resolved by name
-static int g_cd_id    = 0x00;        // ChooseHeroData.id               (il2cpp offset - 0x10)
-static int g_cd_unl   = 0x04;        // ChooseHeroData.unlocked
-static int g_cd_state = 0x98;        // ChooseHeroData.confirmButtonState
+static int g_off_modeldata = 0x28;
+static int g_cd_id    = 0x00;
+static int g_cd_unl   = 0x04;
+static int g_cd_state = 0x98;
 static int g_conf_mask = 0;
 typedef void (*DoHeroConfirm_t)(void *self, void *mi);
 static DoHeroConfirm_t g_doheroconfirm_orig;
@@ -791,47 +689,58 @@ static void doheroconfirm_hook(void *self, void *mi) {
 }
 
 // ---------------------------------------------------------
-// 15. Sales Day challenge always active
-//     Sales Day is emBattleFactor 316. BattleData.get_IsSaleDay is
+// 15. Sales Day challenge always active, produced only from the map/room
+//     builders.
+//     BattleData.get_IsSaleDay is
 //         if (get_IsNormalMode()) return CompareFactor(316); else false
-//     and its callers (map structure generation, chest/special room
-//     instantiation, GetSpecialRoomCount, the Lua wrapper) all go through
-//     it. CompareFactor(factor) is the single per-factor check, so it is
-//     hooked: for factor 316 it returns true whenever IsNormalMode is true
-//     (the same gate the game uses). Every other factor (Bad Luck = 103
-//     and the rest) gets the real answer, so no other challenge changes.
-//     Each distinct return address that asks for 316 is logged once, which
-//     shows who reads the factor.
+//     Its seven callers (scan_issaleday.txt):
+//         BattleDataWrap._g_get_IsSaleDay              (Lua bridge, read-only)
+//         ActivitySchoolMapStructureGenerationStrategy.CreateMapStructure
+//         DefaultMapStructureGenerationStrategy.CreateMapStructure
+//         MapManagerLevel.InstantiateChestRoom
+//         MapManagerLevel.InstantiateSpecialRoom
+//         UIShowCurrencyGroupDesc.GetHeroRoomDefault   (UI text)
+//         BattleData.GetSpecialRoomCount
+//     Only the five gameplay builders in that list need to see Sales Day as
+//     active. The Lua bridge and the UI text get the game's answer, and
+//     nothing else in the game (daily-challenge picker, tally) can see a
+//     forced value, because the old global CompareFactor hook is gone. The
+//     previous design answered CompareFactor(316)=true for every caller,
+//     which let the daily-challenge slot picker believe Sales Day already
+//     occupied a slot. That is what swallowed a challenge; that hook is
+//     removed here.
+//
+//     Sites are found at install by iterating class_get_methods on each of
+//     the five builders and scanning up to the next method of the class
+//     (cap 0x2000) for a bl to get_IsSaleDay's runtime address. No dump.cs
+//     RVA is used, so the same mechanism that keeps the unlock hooks alive
+//     across updates keeps this one.
 // ---------------------------------------------------------
-static const int FACTOR_SALEDAY = 316;
+typedef bool (*IsSaleDay_t)(void *mi);
+static IsSaleDay_t g_issaleday_orig = nullptr;
 
-typedef bool (*CompareFactor_t)(void *self, int factor, void *mi);
-static CompareFactor_t g_comparefactor_orig;
-
-typedef bool (*IsNormalMode_t)(void *self, void *mi);
-static IsNormalMode_t g_isnormal = nullptr;
-static void *g_isnormal_mi = nullptr;
-
-static thread_local bool g_cf_busy = false;
-static uintptr_t g_cf_seen[24];
-static int g_cf_nseen = 0;
+struct SdSiteSet { uintptr_t ra[16]; int hits[16]; int n; };
+static SdSiteSet g_sd_sites;
 
 __attribute__((noinline))
-static bool comparefactor_hook(void *self, int factor, void *mi) {
-    bool r = g_comparefactor_orig(self, factor, mi);
-    if (factor != FACTOR_SALEDAY || r || !self || g_cf_busy) return r;
-    g_cf_busy = true;
-    bool normal = g_isnormal ? g_isnormal(self, g_isnormal_mi) : true;
-    g_cf_busy = false;
-    if (!normal) return r;
+static bool issaleday_hook(void *mi) {
+    static int logged_global = 0;
+    bool orig = g_issaleday_orig ? g_issaleday_orig(mi) : false;
+    if (orig) return true;
     uintptr_t ra = (uintptr_t) __builtin_return_address(0);
-    bool seen = false;
-    for (int i = 0; i < g_cf_nseen; i++) if (g_cf_seen[i] == ra) { seen = true; break; }
-    if (!seen && g_cf_nseen < 24) {
-        g_cf_seen[g_cf_nseen++] = ra;
-        LOGI("saleday: CompareFactor(316) false -> true (ra=%p, site #%d)", (void *) ra, g_cf_nseen);
+    for (int i = 0; i < g_sd_sites.n; i++) {
+        if (ra == g_sd_sites.ra[i]) {
+            if (g_sd_sites.hits[i] < 3) {
+                g_sd_sites.hits[i]++;
+                LOGI("saleday: IsSaleDay true at site %d (ra=%p)", i, (void *) ra);
+            } else if (logged_global < 1) {
+                logged_global++;
+                LOGI("saleday: further site hits suppressed");
+            }
+            return true;
+        }
     }
-    return true;
+    return orig;
 }
 
 // ---------------------------------------------------------
@@ -842,8 +751,6 @@ typedef void *(*MethodByName_t)(void *, const char *, int);
 static ClassFromName_t class_from_name;
 static MethodByName_t  method_by_name;
 
-// Resolve class + method by name, then inline-hook it. Logs on every miss and install.
-// Class lookup: namespace "" first, then any namespace by plain name.
 static size_t (*image_class_count)(void *) = nullptr;
 static void *(*image_get_class)(void *, size_t) = nullptr;
 static const char *(*class_get_name)(void *) = nullptr;
@@ -866,7 +773,6 @@ static void *scan_image(void *img, const char *name) {
     return nullptr;
 }
 
-// Class lookup: namespace "" in img, then by plain name in img, then in every assembly.
 static void *find_class(void *img, const char *name) {
     void *k = class_from_name(img, "", name);
     if (k) return k;
@@ -886,8 +792,6 @@ static uintptr_t method_addr(void *img, const char *cls, const char *m, int argc
     return mi ? (uintptr_t) *(void **) mi : 0;
 }
 
-// Hook EVERY overload of cls.m (method_by_name only returns one per argc).
-// Only for replacements that ignore their arguments and return void.
 static void hook_all_overloads(void *img, const char *cls, const char *m, void *repl) {
     static void *dummy[16];
     static int nd = 0;
@@ -913,8 +817,6 @@ static int (*type_get_type)(void *) = nullptr;
 static const int IL2CPP_TYPE_I4 = 0x08;
 static const int IL2CPP_TYPE_BOOLEAN = 0x02;
 
-// Look up an instance field offset by class + field name. Keeps `fallback`
-// (and logs an E line) if the class or field cannot be found.
 static int resolve_off(void *img, const char *cls, const char *fld, int fallback) {
     void *k = find_class(img, cls);
     void *f = (k && class_get_field && field_get_offset) ? class_get_field(k, fld) : nullptr;
@@ -956,8 +858,6 @@ static void add_site(SiteSet &s, uintptr_t ra, const char *what, const char *cls
     LOGI("unlock: %s site in %s.%s +0x%x", what, cls, m, (unsigned) (ra - 4 - fn));
 }
 
-// Locate cls.m by iterating the class methods, then scan its code (up to the
-// next method of the class, at most 0x2000 bytes) for bl to the accessors.
 static void scan_sites(void *img, const char *cls, const char *m) {
     void *k = find_class(img, cls);
     if (!k || !class_get_methods || !method_get_name) { LOGE("unlock: %s.%s class/methods unavailable", cls, m); return; }
@@ -984,8 +884,36 @@ static void scan_sites(void *img, const char *cls, const char *m) {
     }
 }
 
-// Address of the first method named m in cls, found by iterating the class
-// methods (never method_by_name: it runs Class::Init, see lessons).
+// Locate cls.m by iterating class_get_methods and scan its body (up to the
+// next method of the class, cap 0x2000) for a bl to the accessor `target`.
+// Records the return address of each hit into `g_sd_sites`.
+static void scan_sd_sites(void *img, const char *cls, const char *m, uintptr_t target) {
+    void *k = find_class(img, cls);
+    if (!k || !class_get_methods || !method_get_name) { LOGE("saleday: %s.%s class/methods unavailable", cls, m); return; }
+    std::vector<uintptr_t> all, mine;
+    void *it = nullptr;
+    while (void *mi = class_get_methods(k, &it)) {
+        uintptr_t a = (uintptr_t) *(void **) mi;
+        if (!a) continue;
+        all.push_back(a);
+        if (!strcmp(method_get_name(mi), m)) mine.push_back(a);
+    }
+    if (mine.empty()) { LOGE("saleday: %s.%s not found", cls, m); return; }
+    for (uintptr_t fn : mine) {
+        uintptr_t hi = fn + 0x2000;
+        for (uintptr_t b : all) if (b > fn && b < hi) hi = b;
+        for (uintptr_t at = fn; at < hi; at += 4) {
+            uintptr_t t = bl_target(at);
+            if (t != target) continue;
+            if (g_sd_sites.n >= 16) break;
+            g_sd_sites.ra[g_sd_sites.n] = at + 4;
+            LOGI("saleday: site in %s.%s +0x%x", cls, m, (unsigned) (at - fn));
+            g_sd_sites.n++;
+        }
+        LOGI("saleday: scanned %s.%s range 0x%x", cls, m, (unsigned) (hi - fn));
+    }
+}
+
 static uintptr_t iter_method_addr(void *img, const char *cls, const char *m) {
     void *k = find_class(img, cls);
     if (!k || !class_get_methods || !method_get_name) return 0;
@@ -1051,7 +979,6 @@ static void install(void *h) {
         } else LOGE("InBattleState not found, autoattack falls back to always-true");
     }
 
-    // --- field offsets, resolved by name before any hook that reads them ---
     if (on("mall")) {
         g_off_itemprice  = resolve_off(image, "MallItem", "itemPrice", g_off_itemprice);
         g_off_finalprice = resolve_off(image, "MallItem", "finalPrice", g_off_finalprice);
@@ -1067,7 +994,6 @@ static void install(void *h) {
     if (on("goldarmor"))
         g_off_curcoin = resolve_off(image, "CoinChangeEvent", "curCoinVal", g_off_curcoin);
 
-    // --- unlockall / unlockskin / unlockskill: accessors forced true at fixed call sites ---
     if (on("unlockall") || on("unlockskill") || on("unlockskin")) {
         g_off_charlist = resolve_off(image, "RGSaveManager", "char_list", g_off_charlist);
         g_off_skinlist = resolve_off(image, "RGCharacterInfo", "skin_list", g_off_skinlist);
@@ -1121,7 +1047,6 @@ static void install(void *h) {
 #endif
     }
 
-    // --- hp: HurtHp (base + subclass overrides, deduped by address) ---
     if (on("hp")) {
         const char *hurtnames[3] = {"RGController", "C12Controller", "C13Controller"};
         std::set<void *> done;
@@ -1141,7 +1066,6 @@ static void install(void *h) {
         }
     }
 
-    // --- shield: infinite void shield ---
     if (on("shield")) {
         void *vk = class_from_name(image, "TalentImpl", "BuffImplVoidShield");
         if (!vk) vk = find_class(image, "BuffImplVoidShield");
@@ -1161,12 +1085,10 @@ static void install(void *h) {
              (void *) consume_hook, (void **) &g_consume_orig);
     }
 
-    // --- delaydead: block the second-life countdown ---
     if (on("delaydead"))
         hook(image, "TalentImpl", "BuffImplVoidShield", "AddDelayDeadBuff", 1,
              (void *) adddead_hook, (void **) &g_adddead_orig);
 
-    // --- mall: free in-game purchases ---
     if (on("mall")) {
         hook(image, "RGScript.Data.Mall", "MallData", "BuyItem", 2,
              (void *) buyitem_hook, (void **) &g_buyitem_orig);
@@ -1174,17 +1096,14 @@ static void install(void *h) {
              (void *) hasenough_hook, (void **) &g_hasenough_orig);
     }
 
-    // --- gem: free gem purchases outside dungeon ---
     if (on("gem"))
         hook(image, "", "RGSaveManager", "ConsumeGem", 3,
              (void *) consumegem_hook, (void **) &g_consumegem_orig);
 
-    // --- energy: refill to max once it drops to ENERGY_REFILL ---
     if (on("energy"))
         hook(image, "", "RoleAttributePlayer", "set_energy", 1,
              (void *) setenergy_hook, (void **) &g_setenergy_orig);
 
-    // --- cooldown: scaled by sk_cd.txt ---
     if (on("cooldown")) {
         hook(image, "", "SkillInfo", "get_FinalCooldown", 0,
              (void *) getfinalcd_hook, (void **) &g_getfinalcd_orig);
@@ -1192,7 +1111,6 @@ static void install(void *h) {
              (void *) calcfinalcd_hook, (void **) &g_calcfinalcd_orig);
     }
 
-    // --- items: materials, seeds, vouchers, fish chips never consumed ---
     if (on("items")) {
         hook_all_overloads(image, "ItemData", "ConsumeMaterial", (void *) consumemat_hook);
         hook(image, "", "ItemData", "ConsumeSeed", 1,
@@ -1203,12 +1121,10 @@ static void install(void *h) {
              (void *) consumefishcount_hook, (void **) &g_consumefishcount_orig);
     }
 
-    // --- dizzy: no dizzy ---
     if (on("dizzy"))
         hook(image, "", "DamageCarrierHelper", "ProcessPlayerDizzy", 3,
              (void *) processplayerdizzy_hook, (void **) &g_processplayerdizzy_orig);
 
-    // --- seasoncoin: no deduct + always affordable ---
     if (on("seasoncoin")) {
         hook(image, "RGScript.UI", "WindowBuyOrWatchAdDialog", "DoConsumeSeasonCoin", 0,
              (void *) doconsumeseasoncoin_hook, (void **) &g_doconsumeseasoncoin_orig);
@@ -1218,7 +1134,6 @@ static void install(void *h) {
              (void *) isaffordable_hook, (void **) &g_isaffordable_orig);
     }
 
-    // --- autoattack: all weapons fully automatic ---
     if (on("autoattack")) {
         hook(image, "", "RGWeapon", "get_AutoAttack", 0,
              (void *) autoattack_hook<0>, (void **) &g_autoattack_orig[0]);
@@ -1230,7 +1145,6 @@ static void install(void *h) {
              (void *) m12setattack_hook, (void **) &g_m12setattack_orig);
     }
 
-    // --- crit: always crit for player-camp damage ---
     if (on("crit")) {
         hook(image, "", "DamageTrigger", "HandleCritical", 0,
              (void *) handlecrit_hook, (void **) &g_handlecrit_orig);
@@ -1238,7 +1152,6 @@ static void install(void *h) {
              (void *) dealdamage_hook, (void **) &g_dealdamage_orig);
     }
 
-    // --- shop: HasBuff(10) true inside price code + rate helper 0 ---
     if (on("shop")) {
         uintptr_t rate    = method_addr(image, "DataUtil", "CalBuffExpertShopExtraRate", 1);
         uintptr_t hasbuff = method_addr(image, "BattleData", "HasBuff", 1);
@@ -1271,7 +1184,6 @@ static void install(void *h) {
         }
     }
 
-    // --- goldarmor: +1 max HP and +1 max armor per GOLD_STEP coins (proxy getters only) ---
     if (on("goldarmor")) {
         hook(image, "", "RoleAttributePlayer", "OnCoinChange", 1,
              (void *) oncoin_hook, (void **) &g_oncoin_orig);
@@ -1283,22 +1195,33 @@ static void install(void *h) {
              (void *) getmaxarmor_hook, (void **) &g_getmaxarmor_orig, IL2CPP_TYPE_I4);
     }
 
-    // --- saleday: Sales Day challenge (factor 316) always active ---
+    // --- saleday: Sales Day challenge (effect only, at map/room builders) ---
     if (on("saleday")) {
         void *bk = find_class(image, "BattleData");
-        void *nmi = bk ? method_by_name(bk, "get_IsNormalMode", 0) : nullptr;
-        if (nmi && *(void **) nmi) {
-            g_isnormal = (IsNormalMode_t) *(void **) nmi;
-            g_isnormal_mi = nmi;
-            LOGI("saleday: get_IsNormalMode resolved @%p", (void *) g_isnormal);
-        } else LOGE("saleday: BattleData.get_IsNormalMode not found, gate skipped");
-        hook(image, "", "BattleData", "CompareFactor", 1,
-             (void *) comparefactor_hook, (void **) &g_comparefactor_orig);
+        void *smi = bk ? method_by_name(bk, "get_IsSaleDay", 0) : nullptr;
+        if (!smi || !*(void **) smi) {
+            LOGE("saleday: BattleData.get_IsSaleDay not found, skipped");
+        } else {
+            uintptr_t target = (uintptr_t) *(void **) smi;
+            g_issaleday_orig = (IsSaleDay_t) *(void **) smi;
+            LOGI("saleday: get_IsSaleDay @%p", (void *) target);
+            scan_sd_sites(image, "DefaultMapStructureGenerationStrategy", "CreateMapStructure", target);
+            scan_sd_sites(image, "ActivitySchoolMapStructureGenerationStrategy", "CreateMapStructure", target);
+            scan_sd_sites(image, "MapManagerLevel", "InstantiateChestRoom", target);
+            scan_sd_sites(image, "MapManagerLevel", "InstantiateSpecialRoom", target);
+            scan_sd_sites(image, "BattleData", "GetSpecialRoomCount", target);
+            LOGI("saleday: sites found %d", g_sd_sites.n);
+            if (g_sd_sites.n > 0) {
+#if defined(__aarch64__)
+                A64HookFunction((void *) target, (void *) issaleday_hook, (void **) &g_issaleday_orig);
+                LOGI("saleday: hook installed @%p", (void *) target);
+#endif
+            } else LOGE("saleday: no call sites found, hook skipped");
+        }
     }
 }
 
 void hook_start(void *handle) {
-    // fresh log files on every game start, then note that we got here at all
     { FILE *f = fopen(LOG_PATH_EXT, "w"); if (f) fclose(f); }
     { FILE *f = fopen(LOG_PATH_INT, "w"); if (f) fclose(f); }
     LOGI("hook_start: module entered, pid=%d", (int) getpid());
